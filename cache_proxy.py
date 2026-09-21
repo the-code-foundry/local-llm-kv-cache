@@ -52,6 +52,7 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_PENDING_PREFIX_SEEDS = 16
 
 
 def _session_ref(session_id: str) -> str:
@@ -243,6 +244,10 @@ class PendingPrefixSeed:
     stable_tokens: tuple[int, ...] | None
 
 
+class _NoIdleSlot(RuntimeError):
+    """Signal that all llama slots are reserved by foreground requests."""
+
+
 class LlamaCacheProxy:
     def __init__(
         self,
@@ -300,6 +305,13 @@ class LlamaCacheProxy:
         self.minimum_shared_prefix_tokens = minimum_shared_prefix_tokens
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
+        self.active_slot_ids: set[int] = set()
+        self.active_slot_snapshots: dict[int, Path] = {}
+        self.seed_slot_ids: set[int] = set()
+        self.seed_slot_snapshots: dict[int, Path] = {}
+        self.seed_token_reservations: set[tuple[int, ...]] = set()
+        self.session_locks: dict[str, tuple[threading.Lock, int]] = {}
+        self.session_locks_guard = threading.Lock()
         self.prefix_seed_lock = threading.Lock()
         self.prefix_seeds_in_flight: set[Path] = set()
         self.pending_prefix_seeds: dict[Path, PendingPrefixSeed] = {}
@@ -307,7 +319,14 @@ class LlamaCacheProxy:
         self.foreground_waiters_lock = threading.Lock()
         self._prune()
 
-    def prepare(self, body: dict[str, Any], session_id: str) -> tuple[dict[str, Any], SnapshotPlan]:
+    def prepare(
+        self,
+        body: dict[str, Any],
+        session_id: str,
+        *,
+        excluded_slot_ids: set[int] | None = None,
+        wait_for_slot: bool = True,
+    ) -> tuple[dict[str, Any], SnapshotPlan]:
         prefix_key = cache_key(body)
         session_file = self.cache_dir / cache_filename(session_id, body, "session")
         prefix_file = self.cache_dir / cache_filename("prefix", body, "prefix")
@@ -331,8 +350,8 @@ class LlamaCacheProxy:
             hot_state = None
             # A native cold request may choose any idle slot. Persist every dirty
             # owner before allowing llama.cpp to overwrite one.
-            self._flush_dirty_states("before_eviction")
-            candidate_slot_id = self._wait_for_idle_slot()
+            self._flush_dirty_states("before_eviction", excluded_slot_ids)
+            candidate_slot_id = self._wait_for_idle_slot(excluded_slot_ids, wait=wait_for_slot)
             if session_file.exists():
                 self._forget_slot(candidate_slot_id)
                 restored_source = self._restore_first_available(
@@ -568,6 +587,8 @@ class LlamaCacheProxy:
         status: int,
         finish_reason: str | None = None,
         cached_tokens: int | None = None,
+        *,
+        prune: bool = True,
     ) -> None:
         if status < 200 or status >= 300:
             return
@@ -640,7 +661,7 @@ class LlamaCacheProxy:
         ):
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
         self._retry_pending_prefix_seeds()
-        if did_save:
+        if did_save and prune:
             self._prune()
 
     def _slot_token_count(self, slot_id: int) -> int:
@@ -659,9 +680,10 @@ class LlamaCacheProxy:
                 return int(slot.get("n_prompt_tokens") or 0)
         return 0
 
-    def _flush_dirty_states(self, reason: str) -> None:
+    def _flush_dirty_states(self, reason: str, excluded_slot_ids: set[int] | None = None) -> None:
+        excluded = excluded_slot_ids or set()
         for session_id, state in list(self.session_states.items()):
-            if not state.dirty or state.session_file is None:
+            if not state.dirty or state.session_file is None or state.slot_id in excluded:
                 continue
             session_ref = _session_ref(session_id)
             n_saved = self._save(
@@ -719,7 +741,9 @@ class LlamaCacheProxy:
     def _schedule_prefix_seed(self, plan: SnapshotPlan) -> None:
         if not self.enable_prefix_seeding:
             return
-        if not plan.prefix_payload.get("messages") and not plan.prefix_payload.get("tools"):
+        # llama.cpp chat templates require at least one message. A tools-only
+        # stable prefix cannot be rendered safely and must remain a cold miss.
+        if not plan.prefix_payload.get("messages"):
             return
         pending = PendingPrefixSeed(
             plan.prefix_payload,
@@ -729,6 +753,14 @@ class LlamaCacheProxy:
         )
         with self.prefix_seed_lock:
             existing = self.pending_prefix_seeds.get(plan.prefix_file)
+            if existing is None and len(self.pending_prefix_seeds) >= MAX_PENDING_PREFIX_SEEDS:
+                _log_event(
+                    "prefix_seed_queue_full",
+                    level=logging.WARNING,
+                    filename=plan.prefix_file.name,
+                    limit=MAX_PENDING_PREFIX_SEEDS,
+                )
+                return
             if (
                 existing is not None
                 and existing.stable_tokens is not None
@@ -739,13 +771,6 @@ class LlamaCacheProxy:
             ):
                 pending = replace(pending, stable_tokens=existing.stable_tokens)
             self.pending_prefix_seeds[plan.prefix_file] = pending
-            while len(self.pending_prefix_seeds) > 16:
-                oldest = next(
-                    candidate
-                    for candidate in self.pending_prefix_seeds
-                    if candidate not in self.prefix_seeds_in_flight
-                )
-                self.pending_prefix_seeds.pop(oldest, None)
         self._start_pending_prefix_seed(plan.prefix_file)
 
     def _retry_pending_prefix_seeds(self) -> None:
@@ -779,6 +804,8 @@ class LlamaCacheProxy:
         excluded_slot_id: int | None,
         stable_tokens: tuple[int, ...] | None = None,
     ) -> None:
+        slot_id: int | None = None
+        tokens: tuple[int, ...] | None = None
         try:
             time.sleep(self.prefix_seed_delay_seconds)
             if self._has_foreground_waiters():
@@ -788,50 +815,20 @@ class LlamaCacheProxy:
                 LOGGER.info("prefix seed skipped while proxy is busy: %s", prefix_file.name)
                 return
             try:
-                idle_slots = self._idle_slots()
-                owned_slot_ids = {state.slot_id for state in self.session_states.values()}
-                spare_slots = [
-                    slot
-                    for slot in idle_slots
-                    if int(slot.get("id", -1)) != excluded_slot_id
-                    and int(slot.get("id", -1)) not in owned_slot_ids
-                ]
-                owner: tuple[str, SlotState] | None = None
-                if spare_slots:
-                    slot_id = int(
-                        min(spare_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
-                    )
-                else:
-                    owner = next(
-                        (
-                            (session_id, state)
-                            for session_id, state in self.session_states.items()
-                            if state.slot_id == excluded_slot_id
-                        ),
-                        None,
-                    )
-                    owner_slot = next(
-                        (slot for slot in idle_slots if int(slot.get("id", -1)) == excluded_slot_id),
-                        None,
-                    )
-                    if (
-                        owner is None
-                        or owner_slot is None
-                        or owner[1].dirty
-                        or owner[1].session_file is None
-                        or not owner[1].session_file.is_file()
-                        or int(owner_slot.get("n_prompt_tokens") or 0) != owner[1].n_tokens
-                    ):
-                        LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
-                        return
-                    assert excluded_slot_id is not None
-                    slot_id = excluded_slot_id
-
-                if stable_tokens is None:
-                    request = self._prefix_seed_payload(prefix_payload)
-                    tokens = self._render_tokens(request)
-                else:
-                    tokens = normalize_tokens(stable_tokens)
+                if not self._seed_spare_slots(excluded_slot_id):
+                    LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
+                    return
+            finally:
+                self.operation_lock.release()
+            if stable_tokens is None:
+                request = self._prefix_seed_payload(prefix_payload)
+                tokens = self._render_tokens(request)
+            else:
+                tokens = normalize_tokens(stable_tokens)
+            if not self.operation_lock.acquire(blocking=False):
+                LOGGER.info("prefix seed skipped while proxy is busy: %s", prefix_file.name)
+                return
+            try:
                 published = self._published_shared_prefix(tokens)
                 if published is not None:
                     _log_event(
@@ -841,110 +838,87 @@ class LlamaCacheProxy:
                     )
                     self._discard_pending_prefix_seed(prefix_file, stable_tokens)
                     return
+                if tokens in self.seed_token_reservations:
+                    LOGGER.info("prefix seed skipped: equivalent seed is already reserved: %s", prefix_file.name)
+                    return
                 if self._has_foreground_waiters():
                     LOGGER.info("prefix seed skipped after discovery: foreground request is waiting: %s", prefix_file.name)
                     return
-                slot_changed = False
-                owner_guard: Path | None = None
-                try:
-                    if owner is not None:
-                        owner_guard = owner[1].session_file.with_suffix(
-                            owner[1].session_file.suffix + ".seed-owner.tmp"
-                        )
-                        owner_saved = self._save(
-                            slot_id,
-                            owner_guard,
-                            reason="before_prefix_seed",
-                            session_ref=_session_ref(owner[0]),
-                        )
-                        if owner_saved != owner[1].n_tokens:
-                            _log_event(
-                                "prefix_seed_owner_save_failed",
-                                level=logging.ERROR,
-                                slot_id=slot_id,
-                                session_ref=_session_ref(owner[0]),
-                                expected_tokens=owner[1].n_tokens,
-                                saved_tokens=owner_saved,
-                            )
-                            return
-                    seed_request = {
-                        "prompt": list(tokens),
-                        "cache_prompt": False,
-                        "n_predict": 0,
-                        "stream": False,
-                        "id_slot": slot_id,
-                    }
-                    slot_changed = True
-                    self._json_request(
-                        "POST",
-                        "/completion",
-                        seed_request,
-                        timeout=self.prefix_seed_timeout_seconds,
-                    )
-                    seed_file = self._prefix_seed_target(prefix_file)
-                    manifest_path = self.cache_dir / manifest_filename(seed_file.name)
-                    n_saved = self._save(slot_id, seed_file)
-                    if n_saved != len(tokens):
-                        seed_file.unlink(missing_ok=True)
-                        manifest_path.unlink(missing_ok=True)
-                        _log_event(
-                            "prefix_seed_token_count_mismatch",
-                            level=logging.ERROR,
-                            filename=seed_file.name,
-                            slot_id=slot_id,
-                            expected_tokens=len(tokens),
-                            saved_tokens=n_saved,
-                        )
-                        return
-                    try:
-                        self._write_manifest(seed_file, tokens)
-                    except Exception:
-                        seed_file.unlink(missing_ok=True)
-                        manifest_path.unlink(missing_ok=True)
-                        raise
-                    self._discard_pending_prefix_seed(prefix_file, stable_tokens)
-                    if owner is None:
-                        self._forget_slot(slot_id)
-                finally:
-                    if owner is not None and slot_changed:
-                        try:
-                            # slot_changed is set only after the owner guard was
-                            # created and its saved token count was validated.
-                            n_restored = self._restore(slot_id, owner_guard)
-                        except (RuntimeError, TimeoutError, OSError, TypeError, ValueError):
-                            self._forget_slot(slot_id)
-                            _log_event(
-                                "prefix_seed_owner_restore_failed",
-                                level=logging.ERROR,
-                                slot_id=slot_id,
-                                session_ref=_session_ref(owner[0]),
-                            )
-                        else:
-                            if n_restored != owner[1].n_tokens:
-                                self._forget_slot(slot_id)
-                                _log_event(
-                                    "prefix_seed_owner_restore_failed",
-                                    level=logging.ERROR,
-                                    slot_id=slot_id,
-                                    session_ref=_session_ref(owner[0]),
-                                    expected_tokens=owner[1].n_tokens,
-                                    restored_tokens=n_restored,
-                                )
-                            else:
-                                self.session_states[owner[0]] = replace(
-                                    owner[1], dirty=False
-                                )
-                    if owner_guard is not None:
-                        owner_guard.unlink(missing_ok=True)
-                self._prune()
-                LOGGER.info("seeded stable prefix -> %s", prefix_file.name)
+                spare_slots = self._seed_spare_slots(excluded_slot_id)
+                if not spare_slots:
+                    LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
+                    return
+                slot_id = int(
+                    min(spare_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+                )
+                seed_file = self._prefix_seed_target(prefix_file)
+                self.seed_slot_ids.add(slot_id)
+                self.seed_slot_snapshots[slot_id] = seed_file
+                self.seed_token_reservations.add(tokens)
             finally:
                 self.operation_lock.release()
+            seed_request = {
+                "prompt": list(tokens),
+                "cache_prompt": False,
+                "n_predict": 0,
+                "stream": False,
+                "id_slot": slot_id,
+            }
+            self._json_request(
+                "POST",
+                "/completion",
+                seed_request,
+                timeout=self.prefix_seed_timeout_seconds,
+            )
+            manifest_path = self.cache_dir / manifest_filename(seed_file.name)
+            n_saved = self._save(slot_id, seed_file)
+            if n_saved != len(tokens):
+                seed_file.unlink(missing_ok=True)
+                manifest_path.unlink(missing_ok=True)
+                _log_event(
+                    "prefix_seed_token_count_mismatch",
+                    level=logging.ERROR,
+                    filename=seed_file.name,
+                    slot_id=slot_id,
+                    expected_tokens=len(tokens),
+                    saved_tokens=n_saved,
+                )
+                return
+            try:
+                self._write_manifest(seed_file, tokens)
+            except Exception:
+                seed_file.unlink(missing_ok=True)
+                manifest_path.unlink(missing_ok=True)
+                raise
+            self._discard_pending_prefix_seed(prefix_file, stable_tokens)
+            LOGGER.info("seeded stable prefix -> %s", prefix_file.name)
         except Exception:
             LOGGER.exception("prefix seed failed: %s", prefix_file.name)
         finally:
-            with self.prefix_seed_lock:
-                self.prefix_seeds_in_flight.discard(prefix_file)
+            try:
+                if slot_id is not None:
+                    with self.operation_lock:
+                        self.seed_slot_ids.discard(slot_id)
+                        self.seed_slot_snapshots.pop(slot_id, None)
+                        if tokens is not None:
+                            self.seed_token_reservations.discard(tokens)
+                        self._forget_slot(slot_id)
+                        self._prune()
+            finally:
+                with self.prefix_seed_lock:
+                    self.prefix_seeds_in_flight.discard(prefix_file)
+
+    def _seed_spare_slots(self, excluded_slot_id: int | None) -> list[dict[str, Any]]:
+        """Return idle slots that no foreground request, owner, or seed has reserved."""
+        owned_slot_ids = {state.slot_id for state in self.session_states.values()}
+        reserved_slot_ids = self.active_slot_ids | self.seed_slot_ids
+        return [
+            slot
+            for slot in self._idle_slots()
+            if int(slot.get("id", -1)) != excluded_slot_id
+            and int(slot.get("id", -1)) not in owned_slot_ids
+            and int(slot.get("id", -1)) not in reserved_slot_ids
+        ]
 
     def _discard_pending_prefix_seed(
         self,
@@ -997,6 +971,106 @@ class LlamaCacheProxy:
         with self.foreground_waiters_lock:
             return self.foreground_waiters > 0
 
+    def begin_request(
+        self,
+        body: dict[str, Any],
+        session_id: str,
+    ) -> tuple[dict[str, Any], SnapshotPlan]:
+        """Atomically prepare and reserve one slot for a managed request."""
+        deadline = time.monotonic() + self.wait_seconds
+        while True:
+            with self.operation_lock:
+                try:
+                    request, plan = self.prepare(
+                        body,
+                        session_id,
+                        excluded_slot_ids=self.active_slot_ids | self.seed_slot_ids,
+                        wait_for_slot=False,
+                    )
+                except _NoIdleSlot:
+                    pass
+                else:
+                    slot_id = plan.slot_id if plan.slot_id is not None else plan.candidate_slot_id
+                    if slot_id is None:
+                        raise RuntimeError("prepared request has no llama slot")
+                    if slot_id in self.active_slot_ids or slot_id in self.seed_slot_ids:
+                        raise RuntimeError(f"llama slot {slot_id} is already reserved")
+                    if plan.slot_id is None:
+                        self._forget_slot(slot_id)
+                    self.active_slot_ids.add(slot_id)
+                    reserved_plan = replace(plan, slot_id=slot_id)
+                    self.active_slot_snapshots[slot_id] = reserved_plan.session_file
+                    return with_slot_cache(request, slot_id), reserved_plan
+            if time.monotonic() >= deadline:
+                raise TimeoutError("no unreserved llama slot became available")
+            time.sleep(0.05)
+
+    def complete_request(
+        self,
+        plan: SnapshotPlan,
+        status: int,
+        finish_reason: str | None = None,
+        cached_tokens: int | None = None,
+    ) -> None:
+        """Finalize a request before releasing its reserved slot."""
+        with self.operation_lock:
+            finalized = False
+            try:
+                self.finish(plan, status, finish_reason, cached_tokens, prune=False)
+                finalized = 200 <= status < 300
+            finally:
+                if (
+                    plan.slot_id is not None
+                    and self.active_slot_snapshots.get(plan.slot_id) == plan.session_file
+                ):
+                    self.active_slot_ids.discard(plan.slot_id)
+                    self.active_slot_snapshots.pop(plan.slot_id, None)
+                if finalized:
+                    self._prune()
+
+    def cancel_request(self, plan: SnapshotPlan) -> None:
+        """Release a reserved slot after forwarding failed."""
+        with self.operation_lock:
+            if (
+                plan.slot_id is not None
+                and self.active_slot_snapshots.get(plan.slot_id) == plan.session_file
+            ):
+                self.active_slot_ids.discard(plan.slot_id)
+                self.active_slot_snapshots.pop(plan.slot_id, None)
+
+    @contextmanager
+    def session_operation(self, session_id: str):
+        """Serialize one session while allowing different sessions to overlap."""
+        with self.session_locks_guard:
+            lock, users = self.session_locks.get(session_id, (threading.Lock(), 0))
+            self.session_locks[session_id] = (lock, users + 1)
+        with self.foreground_waiters_lock:
+            self.foreground_waiters += 1
+        try:
+            lock.acquire()
+        except BaseException:
+            with self.foreground_waiters_lock:
+                self.foreground_waiters -= 1
+            with self.session_locks_guard:
+                current_lock, users = self.session_locks[session_id]
+                if users == 1:
+                    self.session_locks.pop(session_id)
+                else:
+                    self.session_locks[session_id] = (current_lock, users - 1)
+            raise
+        try:
+            yield
+        finally:
+            lock.release()
+            with self.foreground_waiters_lock:
+                self.foreground_waiters -= 1
+            with self.session_locks_guard:
+                current_lock, users = self.session_locks[session_id]
+                if users == 1:
+                    self.session_locks.pop(session_id)
+                else:
+                    self.session_locks[session_id] = (current_lock, users - 1)
+
     def _slot_task_ids(self) -> dict[int, int]:
         return {
             int(slot.get("id", -1)): int(slot.get("id_task") or -1)
@@ -1043,7 +1117,15 @@ class LlamaCacheProxy:
         with self.foreground_waiters_lock:
             self.foreground_waiters += 1
         try:
-            self.operation_lock.acquire()
+            deadline = time.monotonic() + self.wait_seconds
+            while True:
+                self.operation_lock.acquire()
+                if not self.active_slot_ids and not self.seed_slot_ids:
+                    break
+                self.operation_lock.release()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("foreground requests did not drain")
+                time.sleep(0.05)
         except BaseException:
             with self.foreground_waiters_lock:
                 self.foreground_waiters -= 1
@@ -1165,15 +1247,24 @@ class LlamaCacheProxy:
         finally:
             connection.close()
 
-    def _wait_for_idle_slot(self) -> int:
+    def _wait_for_idle_slot(
+        self,
+        excluded_slot_ids: set[int] | None = None,
+        *,
+        wait: bool = True,
+    ) -> int:
         deadline = time.monotonic() + self.wait_seconds
-        while time.monotonic() < deadline:
-            slots = self._idle_slots()
+        while True:
+            slots = self._idle_slots(excluded_slot_ids)
             if slots:
                 owned_slots = {state.slot_id for state in self.session_states.values()}
                 unowned_slots = [slot for slot in slots if int(slot.get("id", -1)) not in owned_slots]
                 candidates = unowned_slots or slots
                 return min(candidates, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+            if not wait:
+                raise _NoIdleSlot("no unreserved idle llama slot")
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.5)
         raise TimeoutError("no idle llama slot became available")
 
@@ -1232,17 +1323,29 @@ class LlamaCacheProxy:
         return n_saved
 
     def _prune(self) -> None:
+        protected = set(self.active_slot_snapshots.values())
+        protected.update(self.seed_slot_snapshots.values())
+        protected_temporaries = {
+            path.with_suffix(path.suffix + ".tmp") for path in self.seed_slot_snapshots.values()
+        }
+        protected.update(
+            state.session_file
+            for state in self.session_states.values()
+            if state.dirty and state.session_file is not None
+        )
         for manifest in self.cache_dir.glob("local-llm-prefix-*.bin.manifest.json"):
             snapshot = self.cache_dir / manifest.name.removesuffix(".manifest.json")
             if not snapshot.is_file():
                 manifest.unlink(missing_ok=True)
         for temporary in self.cache_dir.glob("local-llm-*.tmp"):
-            temporary.unlink(missing_ok=True)
+            if temporary not in protected_temporaries:
+                temporary.unlink(missing_ok=True)
+        all_files = list(self.cache_dir.glob("local-llm-*.bin"))
         files = sorted(
-            self.cache_dir.glob("local-llm-*.bin"),
+            (path for path in all_files if path not in protected),
             key=lambda path: path.stat().st_mtime,
         )
-        total = sum(path.stat().st_size for path in files)
+        total = sum(path.stat().st_size for path in all_files)
         while total > self.max_cache_bytes and files:
             victim = files.pop(0)
             size = victim.stat().st_size
@@ -1413,24 +1516,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             session_ref=_session_ref(session_id),
             source="header" if header_session_id else "body" if body_session_id else "anonymous",
         )
+        plan = None
+        reservation_released = False
         try:
-            with self.proxy.foreground_operation():
-                request, plan = self.proxy.prepare(body, session_id)
-                result = self.proxy.forward(
-                    self,
-                    "POST",
-                    self.path,
-                    json.dumps(request).encode("utf-8"),
-                )
+            with self.proxy.session_operation(session_id):
+                request, plan = self.proxy.begin_request(body, session_id)
                 try:
-                    self.proxy.finish(
-                        plan,
-                        result.status,
-                        finish_reason=result.metadata.finish_reason,
-                        cached_tokens=result.metadata.cached_tokens,
+                    result = self.proxy.forward(
+                        self,
+                        "POST",
+                        self.path,
+                        json.dumps(request).encode("utf-8"),
                     )
-                except Exception:
-                    LOGGER.exception("response succeeded but snapshot finalization failed")
+                    try:
+                        # complete_request owns reservation release even if
+                        # snapshot finalization raises.
+                        reservation_released = True
+                        self.proxy.complete_request(
+                            plan,
+                            result.status,
+                            finish_reason=result.metadata.finish_reason,
+                            cached_tokens=result.metadata.cached_tokens,
+                        )
+                    except Exception:
+                        LOGGER.exception("response succeeded but snapshot finalization failed")
+                finally:
+                    if not reservation_released:
+                        self.proxy.cancel_request(plan)
         except (RuntimeError, TimeoutError, OSError) as error:
             self._send_upstream_error(error)
 

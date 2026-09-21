@@ -44,6 +44,16 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 
 The `terminal` policy is intended for agents that chain many tool calls. Deferred state remains in the hot slot and is saved before a cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy takes the safe path and saves immediately.
 
+### Concurrent slot safety
+
+The proxy permits requests for different sessions to overlap when llama.cpp has
+distinct idle slots. Requests for the same session remain serialized. Foreground
+requests and background prefix seeds reserve their slots atomically, so neither
+can restore, save, or evict a snapshot owned by the other. A single-slot server
+therefore remains serialized, while a two-slot server can execute two independent
+sessions concurrently without crossing snapshots. Pending prefix-seed work is
+bounded and yields to foreground traffic.
+
 ### Production Hermes profile
 
 The systemd template in this repository uses `127.0.0.1:18082` for the proxy and `127.0.0.1:8080` for llama.cpp. A Nix deployment may choose another explicit pair, for example proxy `:8080` and upstream `:8081`. In all cases, never run two proxies on the same port or two llama.cpp servers on the same port at the same time.

@@ -87,6 +87,13 @@ class UnavailableProxy:
     def foreground_operation(self):
         yield
 
+    @contextmanager
+    def session_operation(self, _session_id):
+        yield
+
+    def begin_request(self, body, session_id):
+        return self.prepare(body, session_id)
+
     def prepare(self, *_args):
         raise ConnectionRefusedError("llama is unavailable")
 
@@ -103,9 +110,16 @@ class CapturingProxy:
     def foreground_operation(self):
         yield
 
+    @contextmanager
+    def session_operation(self, _session_id):
+        yield
+
     def prepare(self, body, session_id):
         self.session_ids.append(session_id)
         return body, None
+
+    def begin_request(self, body, session_id):
+        return self.prepare(body, session_id)
 
     def prepare_uncached(self, reason):
         self.uncached_reasons.append(reason)
@@ -123,6 +137,12 @@ class CapturingProxy:
         return ForwardResult(200)
 
     def finish(self, *_args, **_kwargs):
+        pass
+
+    def complete_request(self, *args, **kwargs):
+        self.finish(*args, **kwargs)
+
+    def cancel_request(self, _plan):
         pass
 
 
@@ -922,6 +942,19 @@ class CacheProxyTests(unittest.TestCase):
             self.proxy._schedule_prefix_seed(empty_plan)
             thread.assert_not_called()
 
+        tools_only_plan = SnapshotPlan(
+            "session-a",
+            0,
+            "key",
+            empty_plan.session_file,
+            empty_plan.prefix_file,
+            {"messages": [], "tools": [{"type": "function"}]},
+            False,
+        )
+        with patch("cache_proxy.threading.Thread") as thread:
+            self.proxy._schedule_prefix_seed(tools_only_plan)
+            thread.assert_not_called()
+
         seeded_plan = SnapshotPlan(
             "session-a",
             0,
@@ -995,23 +1028,50 @@ class CacheProxyTests(unittest.TestCase):
             self.proxy._retry_pending_prefix_seeds()
             retry_thread.assert_called_once()
 
-    def test_pending_seed_queue_evicts_oldest_non_running_entry(self):
+    def test_pending_seed_queue_applies_backpressure_without_losing_accepted_work(self):
         self.proxy.enable_prefix_seeding = True
-        with patch.object(self.proxy, "_start_pending_prefix_seed"):
-            for index in range(17):
-                plan = SnapshotPlan(
-                    f"session-{index}",
-                    0,
-                    "key",
-                    Path(self.tempdir.name, f"session-{index}.bin"),
-                    Path(self.tempdir.name, f"prefix-{index}.bin"),
-                    {"messages": [{"role": "system", "content": "rules"}], "tools": []},
-                    False,
-                )
-                self.proxy._schedule_prefix_seed(plan)
+        plans = [
+            SnapshotPlan(
+                f"session-{index}",
+                0,
+                "key",
+                Path(self.tempdir.name, f"session-{index}.bin"),
+                Path(self.tempdir.name, f"prefix-{index}.bin"),
+                {"messages": [{"role": "system", "content": "rules"}], "tools": []},
+                False,
+            )
+            for index in range(17)
+        ]
 
-        self.assertEqual(len(self.proxy.pending_prefix_seeds), 16)
-        self.assertNotIn(Path(self.tempdir.name, "prefix-0.bin"), self.proxy.pending_prefix_seeds)
+        with (
+            patch.object(self.proxy, "_start_pending_prefix_seed") as start_seed,
+            patch("cache_proxy._log_event") as log_event,
+        ):
+            for plan in plans[:16]:
+                self.proxy._schedule_prefix_seed(plan)
+            accepted = dict(self.proxy.pending_prefix_seeds)
+
+            self.proxy._schedule_prefix_seed(plans[16])
+
+            self.assertEqual(self.proxy.pending_prefix_seeds, accepted)
+            self.assertNotIn(plans[16].prefix_file, self.proxy.pending_prefix_seeds)
+            self.assertEqual(start_seed.call_count, 16)
+            log_event.assert_called_once_with(
+                "prefix_seed_queue_full",
+                level=cache_proxy.logging.WARNING,
+                filename=plans[16].prefix_file.name,
+                limit=16,
+            )
+
+            updated = replace(plans[0], stable_prefix_seed_tokens=(1, 2, 3))
+            self.proxy._schedule_prefix_seed(updated)
+
+            self.assertEqual(set(self.proxy.pending_prefix_seeds), set(accepted))
+            self.assertEqual(
+                self.proxy.pending_prefix_seeds[updated.prefix_file].stable_tokens,
+                (1, 2, 3),
+            )
+            start_seed.assert_called_with(updated.prefix_file)
 
     def test_completed_old_seed_does_not_discard_newer_longer_pending_seed(self):
         prefix_file = Path(self.tempdir.name, "prefix.bin")
@@ -1048,6 +1108,313 @@ class CacheProxyTests(unittest.TestCase):
             with self.proxy.foreground_operation():
                 raise ValueError("request failed")
         self.assertEqual(self.proxy.foreground_waiters, 0)
+
+    def _run_reserved_request(self, session_id, entered, release, results):
+        with self.proxy.session_operation(session_id):
+            request, plan = self.proxy.begin_request(self.body, session_id)
+            results.append((session_id, request["id_slot"], plan.session_file))
+            entered.set()
+            self.assertTrue(release.wait(2))
+            self.proxy.complete_request(plan, 200)
+
+    def test_distinct_sessions_forward_concurrently_on_separate_slots_without_snapshot_crossing(self):
+        slots = [
+            {"id": 0, "is_processing": False, "n_prompt_tokens": 0},
+            {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+        ]
+        self.proxy._slots = Mock(return_value=slots)
+        self.proxy._render_tokens = Mock(side_effect=ValueError("no shared prefix"))
+        saves = []
+
+        def save(slot_id, target, **_kwargs):
+            saves.append((slot_id, target))
+            return 10
+
+        self.proxy._save = Mock(side_effect=save)
+        entered = [threading.Event(), threading.Event()]
+        release = threading.Event()
+        results = []
+        threads = [
+            threading.Thread(
+                target=self._run_reserved_request,
+                args=(session_id, entered[index], release, results),
+            )
+            for index, session_id in enumerate(("parallel-a", "parallel-b"))
+        ]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered[0].wait(2))
+        self.assertTrue(entered[1].wait(2))
+        self.assertEqual({slot_id for _session, slot_id, _path in results}, {0, 1})
+        release.set()
+        for thread in threads:
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+        expected = {session: (slot_id, path) for session, slot_id, path in results}
+        self.assertEqual(
+            {(slot_id, target) for slot_id, target in saves},
+            {(slot_id, path) for slot_id, path in expected.values()},
+        )
+        self.assertEqual(
+            {session: state.slot_id for session, state in self.proxy.session_states.items()},
+            {session: slot_id for session, (slot_id, _path) in expected.items()},
+        )
+
+    def test_same_session_requests_remain_serialized(self):
+        slots = [
+            {"id": 0, "is_processing": False, "n_prompt_tokens": 0},
+            {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+        ]
+        self.proxy._slots = Mock(return_value=slots)
+        self.proxy._render_tokens = Mock(side_effect=ValueError("no shared prefix"))
+        self.proxy._save = Mock(return_value=10)
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        first_release = threading.Event()
+        second_release = threading.Event()
+        results = []
+        first = threading.Thread(
+            target=self._run_reserved_request,
+            args=("same-session", first_entered, first_release, results),
+        )
+        second = threading.Thread(
+            target=self._run_reserved_request,
+            args=("same-session", second_entered, second_release, results),
+        )
+        first.start()
+        self.assertTrue(first_entered.wait(2))
+        second.start()
+        self.assertFalse(second_entered.wait(0.2))
+        first_release.set()
+        first.join(2)
+        self.assertTrue(second_entered.wait(2))
+        second_release.set()
+        second.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+
+    def test_preparing_parallel_session_never_flushes_active_slot_snapshot(self):
+        active_snapshot = Path(self.tempdir.name, "active-session.bin")
+        self.proxy.session_states["active"] = SlotState(
+            0,
+            cache_key(self.body),
+            12,
+            active_snapshot,
+            True,
+        )
+        self.proxy.active_slot_ids.add(0)
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": True, "n_prompt_tokens": 12},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+            ]
+        )
+        self.proxy._render_tokens = Mock(side_effect=ValueError("no shared prefix"))
+        self.proxy._save = Mock()
+
+        request, plan = self.proxy.prepare(
+            self.body,
+            "parallel",
+            excluded_slot_ids={0},
+            wait_for_slot=False,
+        )
+
+        self.assertNotIn("id_slot", request)
+        self.assertEqual(plan.candidate_slot_id, 1)
+        self.proxy._save.assert_not_called()
+
+    def test_single_slot_serializes_distinct_sessions(self):
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 0}]
+        )
+        self.proxy._render_tokens = Mock(side_effect=ValueError("no shared prefix"))
+        self.proxy._save = Mock(return_value=10)
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        first_release = threading.Event()
+        second_release = threading.Event()
+        results = []
+        first = threading.Thread(
+            target=self._run_reserved_request,
+            args=("single-a", first_entered, first_release, results),
+        )
+        second = threading.Thread(
+            target=self._run_reserved_request,
+            args=("single-b", second_entered, second_release, results),
+        )
+        first.start()
+        self.assertTrue(first_entered.wait(2))
+        second.start()
+        self.assertFalse(second_entered.wait(0.2))
+        first_release.set()
+        first.join(2)
+        self.assertTrue(second_entered.wait(2))
+        second_release.set()
+        second.join(2)
+        self.assertEqual([slot_id for _session, slot_id, _path in results], [0, 0])
+
+    def test_prefix_seed_cannot_race_reserved_foreground_slot(self):
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": False, "n_prompt_tokens": 0},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+            ]
+        )
+        self.proxy._render_tokens = Mock(side_effect=ValueError("no shared prefix"))
+        with self.proxy.session_operation("foreground"):
+            request, plan = self.proxy.begin_request(self.body, "foreground")
+            self.assertIn("id_slot", request)
+            self.proxy.prefix_seed_delay_seconds = 0
+            self.proxy._json_request = Mock()
+            self.proxy._seed_prefix(self.body, Path(self.tempdir.name, "prefix.bin"), plan.slot_id)
+            self.proxy._json_request.assert_not_called()
+            self.proxy.cancel_request(plan)
+
+    def test_long_seed_on_spare_slot_does_not_block_hot_owner_foreground(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_snapshot = Path(self.tempdir.name, "owner.bin")
+        owner_snapshot.write_bytes(b"known-hot-owner")
+        owner_state = SlotState(0, cache_key(self.body), 10, owner_snapshot, False)
+        self.proxy.session_states["owner"] = owner_state
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": False, "n_prompt_tokens": 10},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+            ]
+        )
+        seed_entered_completion = threading.Event()
+        release_seed = threading.Event()
+        foreground_acquired = threading.Event()
+        foreground_result = []
+
+        def block_seed(_method, path, _payload, **_kwargs):
+            self.assertEqual(path, "/completion")
+            seed_entered_completion.set()
+            self.assertTrue(release_seed.wait(2))
+            return {}
+
+        def save_seed(slot_id, target, **_kwargs):
+            self.assertEqual(slot_id, 1)
+            target.write_bytes(b"seed")
+            return 3
+
+        def run_foreground():
+            with self.proxy.session_operation("owner"):
+                request, plan = self.proxy.begin_request(self.body, "owner")
+                foreground_result.append((request["id_slot"], plan))
+                foreground_acquired.set()
+                self.proxy.cancel_request(plan)
+
+        self.proxy._json_request = Mock(side_effect=block_seed)
+        self.proxy._save = Mock(side_effect=save_seed)
+        seed_thread = threading.Thread(
+            target=self.proxy._seed_prefix,
+            args=(self.body, Path(self.tempdir.name, "prefix.bin"), 0, (1, 2, 3)),
+        )
+        foreground_thread = threading.Thread(target=run_foreground)
+        seed_thread.start()
+        try:
+            self.assertTrue(seed_entered_completion.wait(1))
+            self.assertEqual(self.proxy.seed_slot_ids, {1})
+            foreground_thread.start()
+            self.assertTrue(
+                foreground_acquired.wait(0.5),
+                "foreground stayed blocked while the spare-slot seed RPC was running",
+            )
+        finally:
+            release_seed.set()
+            seed_thread.join(2)
+            foreground_thread.join(2)
+
+        self.assertFalse(seed_thread.is_alive())
+        self.assertFalse(foreground_thread.is_alive())
+        self.assertEqual(foreground_result[0][0], 0)
+        self.assertEqual(self.proxy.session_states["owner"], owner_state)
+        self.assertEqual(owner_snapshot.read_bytes(), b"known-hot-owner")
+        self.assertEqual(self.proxy.seed_slot_ids, set())
+
+    def test_failed_seed_releases_slot_and_token_reservations_but_keeps_pending(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": False, "n_prompt_tokens": 0},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+            ]
+        )
+        prefix_file = Path(self.tempdir.name, "prefix-failure.bin")
+        pending = cache_proxy.PendingPrefixSeed(self.body, prefix_file, 0, (1, 2, 3))
+        self.proxy.pending_prefix_seeds[prefix_file] = pending
+        self.proxy.prefix_seeds_in_flight.add(prefix_file)
+        self.proxy._json_request = Mock(side_effect=RuntimeError("seed failed"))
+        self.proxy._save = Mock()
+        self.proxy._prune = Mock()
+
+        self.proxy._seed_prefix(self.body, prefix_file, 0, (1, 2, 3))
+
+        self.assertEqual(self.proxy.seed_slot_ids, set())
+        self.assertEqual(self.proxy.seed_slot_snapshots, {})
+        self.assertEqual(self.proxy.seed_token_reservations, set())
+        self.assertEqual(self.proxy.pending_prefix_seeds[prefix_file], pending)
+        self.assertNotIn(prefix_file, self.proxy.prefix_seeds_in_flight)
+        self.proxy._save.assert_not_called()
+
+    def test_concurrent_seeds_atomically_reserve_distinct_spare_slots(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy.session_states["owner"] = SlotState(0, cache_key(self.body), 10)
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 0, "is_processing": False, "n_prompt_tokens": 10},
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 0},
+                {"id": 2, "is_processing": False, "n_prompt_tokens": 0},
+            ]
+        )
+        entered = {(1, 2, 3): threading.Event(), (4, 5, 6): threading.Event()}
+        release = threading.Event()
+        completion_slots = []
+
+        def block_seed(_method, path, payload, **_kwargs):
+            self.assertEqual(path, "/completion")
+            tokens = tuple(payload["prompt"])
+            completion_slots.append(payload["id_slot"])
+            entered[tokens].set()
+            self.assertTrue(release.wait(2))
+            return {}
+
+        def save_seed(_slot_id, target, **_kwargs):
+            target.write_bytes(b"seed")
+            return 3
+
+        self.proxy._json_request = Mock(side_effect=block_seed)
+        self.proxy._save = Mock(side_effect=save_seed)
+        threads = [
+            threading.Thread(
+                target=self.proxy._seed_prefix,
+                args=(
+                    self.body,
+                    Path(self.tempdir.name, f"prefix-{index}.bin"),
+                    0,
+                    tokens,
+                ),
+            )
+            for index, tokens in enumerate(((1, 2, 3), (4, 5, 6)))
+        ]
+        threads[0].start()
+        try:
+            self.assertTrue(entered[(1, 2, 3)].wait(1))
+            threads[1].start()
+            self.assertTrue(entered[(4, 5, 6)].wait(1))
+            self.assertEqual(self.proxy.seed_slot_ids, {1, 2})
+            self.assertEqual(set(completion_slots), {1, 2})
+        finally:
+            release.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(self.proxy.seed_slot_ids, set())
+        self.assertEqual(self.proxy.seed_token_reservations, set())
 
     def test_session_snapshot_wins_after_switching_same_prefix_session(self):
         _, first_plan = self.proxy.prepare(self.body, "session-a")
@@ -1230,6 +1597,7 @@ class CacheProxyTests(unittest.TestCase):
             {"messages": [{"role": "system", "content": "rules"}]},
             Path(self.tempdir.name, "prefix.bin"),
             excluded_slot_id=1,
+            stable_tokens=(1, 2, 3),
         )
 
         self.proxy._json_request.assert_not_called()
@@ -1390,58 +1758,64 @@ class CacheProxyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.proxy._write_manifest(Path(self.tempdir.name, "missing.bin"), (1, 2))
 
-    def test_one_slot_seed_saves_clean_owner_writes_manifest_then_restores(self):
+    def test_prefix_seed_never_borrows_clean_owned_slot_and_releases_foreground_lock(self):
         self.proxy.prefix_seed_delay_seconds = 0
         owner_file = Path(self.tempdir.name, "owner.bin")
         owner_file.write_bytes(b"persisted")
         self.proxy.session_states = {
             "owner": SlotState(0, "key", 10, owner_file, False),
         }
-        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}])
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
+        )
         self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
         prefix_file = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
-        events = []
+        pending = cache_proxy.PendingPrefixSeed(
+            self.body,
+            prefix_file,
+            0,
+            (1, 2, 3),
+        )
+        self.proxy.pending_prefix_seeds[prefix_file] = pending
+        self.proxy.prefix_seeds_in_flight.add(prefix_file)
+        seed_started = threading.Event()
+        unblock_seed = threading.Event()
+
+        def block_seed(*_args, **_kwargs):
+            seed_started.set()
+            unblock_seed.wait(1)
+            return {}
+
+        self.proxy._json_request = Mock(side_effect=block_seed)
 
         def save(slot, target, **_kwargs):
-            events.append(("save", target.name))
             target.write_bytes(b"snapshot")
             return 10 if target.name.endswith(".seed-owner.tmp") else 3
 
         self.proxy._save = Mock(side_effect=save)
-        self.proxy._json_request = Mock(
-            side_effect=lambda *_args, **_kwargs: events.append(("seed", None)) or {}
+        self.proxy._restore = Mock(return_value=10)
+        worker = threading.Thread(
+            target=self.proxy._seed_prefix,
+            args=(self.body, prefix_file, 0, (1, 2, 3)),
         )
-        self.proxy._restore = Mock(side_effect=lambda _slot, source: events.append(("restore", source.name)) or 10)
 
-        self.proxy._seed_prefix(self.body, prefix_file, excluded_slot_id=0)
+        worker.start()
+        seed_started.wait(0.1)
+        worker.join(0.1)
+        worker_was_alive = worker.is_alive()
+        foreground_acquired = self.proxy.operation_lock.acquire(timeout=0.05)
+        if foreground_acquired:
+            self.proxy.operation_lock.release()
+        unblock_seed.set()
+        worker.join(1)
 
-        self.proxy._json_request.assert_called_once_with(
-            "POST",
-            "/completion",
-            {
-                "prompt": [1, 2, 3],
-                "cache_prompt": False,
-                "n_predict": 0,
-                "stream": False,
-                "id_slot": 0,
-            },
-            timeout=600.0,
-        )
-        self.assertEqual(
-            events,
-            [
-                ("save", "owner.bin.seed-owner.tmp"),
-                ("seed", None),
-                ("save", prefix_file.name),
-                ("restore", "owner.bin.seed-owner.tmp"),
-            ],
-        )
-        manifest_path = Path(self.tempdir.name, manifest_filename(prefix_file.name))
-        manifest = PrefixManifest.from_json(manifest_path.read_bytes())
-        self.assertEqual(manifest.tokens, (1, 2, 3))
-        self.assertEqual(manifest.snapshot, prefix_file.name)
-        self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.proxy.session_states["owner"].slot_id, 0)
+        self.assertFalse(worker_was_alive)
+        self.assertTrue(foreground_acquired)
+        self.proxy._json_request.assert_not_called()
+        self.proxy._save.assert_not_called()
+        self.proxy._restore.assert_not_called()
+        self.assertEqual(self.proxy.pending_prefix_seeds[prefix_file], pending)
+        self.assertNotIn(prefix_file, self.proxy.prefix_seeds_in_flight)
 
     def test_one_slot_seed_skips_dirty_missing_mismatched_or_waiting_owner(self):
         self.proxy.prefix_seed_delay_seconds = 0
@@ -1465,90 +1839,6 @@ class CacheProxyTests(unittest.TestCase):
 
         self.proxy._json_request.assert_not_called()
         self.proxy._save.assert_not_called()
-
-    def test_one_slot_seed_failure_rolls_back_and_restore_failure_forgets_hot_owner(self):
-        self.proxy.prefix_seed_delay_seconds = 0
-        owner_file = Path(self.tempdir.name, "owner.bin")
-        owner_file.write_bytes(b"persisted")
-        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
-        self.proxy.session_states = {"owner": SlotState(0, "key", 10, owner_file, False)}
-        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}])
-        self.proxy._render_tokens = Mock(return_value=(1, 2))
-        self.proxy._save = Mock(return_value=10)
-        self.proxy._json_request = Mock(side_effect=RuntimeError("seed failed"))
-        self.proxy._restore = Mock(return_value=10)
-
-        self.proxy._seed_prefix(self.body, prefix, 0)
-
-        self.proxy._restore.assert_called_once_with(
-            0, owner_file.with_suffix(".bin.seed-owner.tmp")
-        )
-        self.assertIn("owner", self.proxy.session_states)
-        self.assertFalse(prefix.exists())
-
-        self.proxy._json_request = Mock(return_value={})
-        self.proxy._save = Mock(
-            side_effect=lambda _slot, target, **_kwargs: (
-                target.write_bytes(b"x"),
-                10 if target.name.endswith(".seed-owner.tmp") else 2,
-            )[1]
-        )
-        self.proxy._restore = Mock(side_effect=RuntimeError("restore failed"))
-        self.proxy._seed_prefix(self.body, prefix, 0)
-
-        self.assertNotIn("owner", self.proxy.session_states)
-        self.assertTrue(owner_file.exists())
-
-    def test_one_slot_seed_keeps_known_good_owner_when_guard_save_count_mismatches(self):
-        self.proxy.prefix_seed_delay_seconds = 0
-        owner_file = Path(self.tempdir.name, "owner.bin")
-        owner_file.write_bytes(b"known-good")
-        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
-        original_state = SlotState(0, "key", 10, owner_file, False)
-        self.proxy.session_states = {"owner": original_state}
-        self.proxy._slots = Mock(
-            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
-        )
-        self.proxy._render_tokens = Mock(return_value=(1, 2))
-        self.proxy._json_request = Mock(return_value={})
-
-        def mismatched_guard_save(_slot, target, **_kwargs):
-            target.write_bytes(b"bad-guard")
-            return 9
-
-        self.proxy._save = Mock(side_effect=mismatched_guard_save)
-        self.proxy._restore = Mock()
-
-        self.proxy._seed_prefix(self.body, prefix, 0)
-
-        self.assertEqual(owner_file.read_bytes(), b"known-good")
-        self.assertEqual(self.proxy.session_states["owner"], original_state)
-        self.assertFalse(owner_file.with_suffix(".bin.seed-owner.tmp").exists())
-        self.proxy._restore.assert_not_called()
-        self.proxy._json_request.assert_not_called()
-
-    def test_one_slot_seed_forgets_owner_on_restore_count_mismatch(self):
-        self.proxy.prefix_seed_delay_seconds = 0
-        owner_file = Path(self.tempdir.name, "owner.bin")
-        owner_file.write_bytes(b"persisted")
-        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
-        self.proxy.session_states = {"owner": SlotState(0, "key", 10, owner_file, False)}
-        self.proxy._slots = Mock(
-            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
-        )
-        self.proxy._render_tokens = Mock(return_value=(1, 2))
-        self.proxy._json_request = Mock(return_value={})
-        self.proxy._save = Mock(
-            side_effect=lambda _slot, target, **_kwargs: (
-                target.write_bytes(b"x"),
-                10 if target.name.endswith(".seed-owner.tmp") else 2,
-            )[1]
-        )
-        self.proxy._restore = Mock(return_value=9)
-
-        self.proxy._seed_prefix(self.body, prefix, 0)
-
-        self.assertNotIn("owner", self.proxy.session_states)
 
     def test_prefix_seed_skips_when_foreground_is_waiting_or_proxy_is_busy(self):
         self.proxy.prefix_seed_delay_seconds = 0
@@ -2289,6 +2579,127 @@ class CacheProxyTests(unittest.TestCase):
         proxy._prune()
 
         self.assertFalse(snapshot.exists())
+
+    def test_completion_prunes_without_deleting_another_active_snapshot(self):
+        active_snapshot = Path(self.tempdir.name, "local-llm-session-active.bin")
+        active_snapshot.write_bytes(b"durable-active-checkpoint")
+        completed_snapshot = Path(self.tempdir.name, "local-llm-session-completed.bin")
+        self.proxy.max_cache_bytes = 0
+        self.proxy.active_slot_ids.update({0, 1})
+        self.proxy.active_slot_snapshots.update({0: active_snapshot, 1: completed_snapshot})
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (
+                target.write_bytes(b"completed-checkpoint"),
+                10,
+            )[1]
+        )
+        plan = SnapshotPlan(
+            "completed-session",
+            1,
+            "completed-prefix",
+            completed_snapshot,
+            Path(self.tempdir.name, "local-llm-prefix-completed.bin"),
+            {"messages": [], "tools": []},
+            True,
+        )
+
+        self.proxy.complete_request(plan, 200)
+
+        self.assertTrue(active_snapshot.exists())
+        self.assertFalse(completed_snapshot.exists())
+        self.assertEqual(self.proxy.active_slot_ids, {0})
+        self.assertEqual(self.proxy.active_slot_snapshots, {0: active_snapshot})
+
+    def test_repeated_overlapping_completions_enforce_limit_except_active_snapshot(self):
+        active_snapshot = Path(self.tempdir.name, "local-llm-session-active.bin")
+        active_snapshot.write_bytes(b"durable-active-checkpoint")
+        self.proxy.max_cache_bytes = active_snapshot.stat().st_size
+        self.proxy.active_slot_ids.add(0)
+        self.proxy.active_slot_snapshots[0] = active_snapshot
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (
+                target.write_bytes(b"completed-checkpoint"),
+                10,
+            )[1]
+        )
+
+        for index in range(5):
+            completed_snapshot = Path(
+                self.tempdir.name,
+                f"local-llm-session-completed-{index}.bin",
+            )
+            self.proxy.active_slot_ids.add(1)
+            self.proxy.active_slot_snapshots[1] = completed_snapshot
+            plan = SnapshotPlan(
+                f"completed-session-{index}",
+                1,
+                f"completed-prefix-{index}",
+                completed_snapshot,
+                Path(self.tempdir.name, f"local-llm-prefix-completed-{index}.bin"),
+                {"messages": [], "tools": []},
+                True,
+            )
+
+            self.proxy.complete_request(plan, 200)
+
+            self.assertTrue(active_snapshot.exists())
+            self.assertFalse(completed_snapshot.exists())
+            self.assertEqual(self.proxy.active_slot_ids, {0})
+            self.assertEqual(self.proxy.active_slot_snapshots, {0: active_snapshot})
+            self.assertLessEqual(
+                sum(path.stat().st_size for path in Path(self.tempdir.name).glob("local-llm-*.bin")),
+                self.proxy.max_cache_bytes,
+            )
+
+    def test_stale_cancel_does_not_release_reused_slot_after_completion(self):
+        first = Path(self.tempdir.name, "local-llm-session-first.bin")
+        second = Path(self.tempdir.name, "local-llm-session-second.bin")
+        first_plan = SnapshotPlan(
+            "first",
+            0,
+            "first-prefix",
+            first,
+            Path(self.tempdir.name, "local-llm-prefix-first.bin"),
+            {"messages": [], "tools": []},
+            True,
+        )
+        self.proxy.active_slot_ids.add(0)
+        self.proxy.active_slot_snapshots[0] = first
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (target.write_bytes(b"snapshot"), 10)[1]
+        )
+
+        self.proxy.complete_request(first_plan, 200)
+        self.proxy.active_slot_ids.add(0)
+        self.proxy.active_slot_snapshots[0] = second
+
+        self.proxy.cancel_request(first_plan)
+
+        self.assertEqual(self.proxy.active_slot_snapshots[0], second)
+        self.assertEqual(self.proxy.active_slot_ids, {0})
+
+    def test_direct_finish_still_enforces_cache_limit(self):
+        old_snapshot = Path(self.tempdir.name, "local-llm-session-old-direct.bin")
+        old_snapshot.write_bytes(b"old")
+        new_snapshot = Path(self.tempdir.name, "local-llm-session-new-direct.bin")
+        self.proxy.max_cache_bytes = len(b"new")
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (target.write_bytes(b"new"), 10)[1]
+        )
+        plan = SnapshotPlan(
+            "direct",
+            0,
+            "direct-prefix",
+            new_snapshot,
+            Path(self.tempdir.name, "local-llm-prefix-direct.bin"),
+            {"messages": [], "tools": []},
+            True,
+        )
+
+        self.proxy.finish(plan, 200)
+
+        self.assertFalse(old_snapshot.exists())
+        self.assertTrue(new_snapshot.exists())
 
     def test_prune_removes_prefix_manifest_with_snapshot(self):
         snapshot = self._write_shared("local-llm-prefix-old.bin", [1, 2])
