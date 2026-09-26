@@ -263,6 +263,7 @@ class LlamaCacheProxy:
         minimum_shared_prefix_tokens: int = 128,
         prefix_seed_timeout_seconds: float = 600.0,
         enable_shared_prefixes: bool = True,
+        anonymous_affinity: str = "project",
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -277,6 +278,9 @@ class LlamaCacheProxy:
         self.wait_seconds = wait_seconds
         self.enable_prefix_seeding = enable_prefix_seeding
         self.enable_shared_prefixes = enable_shared_prefixes
+        if anonymous_affinity not in {"project", "conversation-start"}:
+            raise ValueError("anonymous_affinity must be 'project' or 'conversation-start'")
+        self.anonymous_affinity = anonymous_affinity
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
         if (
             isinstance(prefix_seed_timeout_seconds, bool)
@@ -1405,8 +1409,26 @@ def _without_proxy_affinity_fields(body: dict[str, Any]) -> dict[str, Any]:
     return request
 
 
-def _anonymous_session_id(body: dict[str, Any]) -> str:
-    return f"anonymous-{cache_key(body)}"
+def _anonymous_session_id(body: dict[str, Any], affinity: str = "project") -> str:
+    if affinity == "project":
+        key = cache_key(body)
+    elif affinity == "conversation-start":
+        payload = build_prefix_payload(body)
+        prefix_count = len(payload.get("messages") or [])
+        for message in (body.get("messages") or [])[prefix_count:]:
+            if isinstance(message, dict):
+                payload["conversation_start"] = copy.deepcopy(message)
+                break
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        key = hashlib.sha256(encoded).hexdigest()
+    else:
+        raise ValueError("anonymous affinity must be 'project' or 'conversation-start'")
+    return f"anonymous-{key}"
 
 
 def _has_media(body: dict[str, Any]) -> bool:
@@ -1513,7 +1535,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if explicit_session_id is None and self.proxy.require_session_id:
             self.send_error(400, "a stable session ID is required")
             return
-        session_id = explicit_session_id or _anonymous_session_id(body)
+        session_id = explicit_session_id or _anonymous_session_id(
+            body,
+            getattr(self.proxy, "anonymous_affinity", "project"),
+        )
         _log_event(
             "session_resolve",
             session_ref=_session_ref(session_id),
@@ -1569,6 +1594,7 @@ def main() -> None:
         wait_seconds=float(os.environ.get("PI_LLAMA_CACHE_WAIT_SECONDS", "120")),
         enable_prefix_seeding=_env_bool("PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING", True),
         enable_shared_prefixes=_env_bool("PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES", True),
+        anonymous_affinity=os.environ.get("PI_LLAMA_CACHE_ANONYMOUS_AFFINITY", "project").strip(),
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
         prefix_seed_timeout_seconds=float(
             os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT", "600")

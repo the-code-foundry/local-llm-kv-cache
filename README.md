@@ -43,6 +43,7 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 | `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS` | `128` | Minimum length of the exact longest common prefix (LCP) required to retain a shared candidate. Must be a strictly positive integer. |
 | `PI_LLAMA_CACHE_SAVE_POLICY` | `all` | `all` saves after every successful response. `terminal` defers the write for `finish_reason=tool_calls`, then saves after a terminal response, before eviction, or during a clean shutdown. |
 | `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | When `true`, rejects cache-managed text chat requests that provide no session identifier. Requests containing media remain accepted: they are serialized but unmanaged after any dirty state has been saved. |
+| `PI_LLAMA_CACHE_ANONYMOUS_AFFINITY` | `project` | Fallback key when no explicit session ID exists. `project` hashes only the stable system prefix; `conversation-start` also hashes the first non-system message so concurrent agent conversations do not share one snapshot. |
 | `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshots. A successful restore or hot reuse updates recency. |
 
 The `terminal` policy is intended for agents that chain many tool calls. Deferred state remains in the hot slot and is saved before a cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy takes the safe path and saves immediately.
@@ -61,13 +62,17 @@ PI_LLAMA_CACHE_NAMESPACE=qwfnfer-qwen38-flash-next-q4-192k-v1
 PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES=false
 PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=false
 PI_LLAMA_CACHE_SAVE_POLICY=terminal
-PI_LLAMA_CACHE_REQUIRE_SESSION_ID=true
+PI_LLAMA_CACHE_REQUIRE_SESSION_ID=false
+PI_LLAMA_CACHE_ANONYMOUS_AFFINITY=conversation-start
 ```
 
 The QwFNfer archive contains its own model/configuration fingerprint and SHA-256
 integrity envelope. It is not compatible with llama.cpp `.bin` slot files. A
 restore is useful only when the next prompt is an exact extension of the saved
-token sequence; QwFNfer resets and fully prefills on any divergence.
+token sequence; QwFNfer resets and fully prefills on any divergence. The
+`conversation-start` fallback covers clients such as BB ACP that do not
+propagate a stable Hermes session ID. Exact-extension validation remains the
+fail-closed guard if two conversations start with identical content.
 
 ### Concurrent slot safety
 

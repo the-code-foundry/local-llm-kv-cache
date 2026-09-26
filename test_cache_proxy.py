@@ -1897,7 +1897,7 @@ class CacheProxyTests(unittest.TestCase):
         self.assertFalse(seed["add_generation_prompt"])
         self.assertFalse(seed["cache_prompt"])
 
-    def test_anonymous_affinity_follows_project_prefix_not_user_message(self):
+    def test_anonymous_project_affinity_follows_project_prefix_not_user_message(self):
         other_body = {
             **self.body,
             "messages": [self.body["messages"][0], {"role": "user", "content": "new"}],
@@ -1909,6 +1909,23 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertEqual(_anonymous_session_id(self.body), _anonymous_session_id(other_body))
         self.assertNotEqual(_anonymous_session_id(self.body), _anonymous_session_id(changed_project))
+
+    def test_anonymous_conversation_affinity_uses_first_non_system_message(self):
+        continued = {
+            **self.body,
+            "messages": self.body["messages"] + [
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "follow-up"},
+            ],
+        }
+        different_start = {
+            **self.body,
+            "messages": [self.body["messages"][0], {"role": "user", "content": "different task"}],
+        }
+
+        original = _anonymous_session_id(self.body, "conversation-start")
+        self.assertEqual(original, _anonymous_session_id(continued, "conversation-start"))
+        self.assertNotEqual(original, _anonymous_session_id(different_start, "conversation-start"))
 
     def test_affinity_helpers_use_priority_and_strip_proxy_fields(self):
         handler = RecordingHandler(
