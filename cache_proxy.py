@@ -262,6 +262,7 @@ class LlamaCacheProxy:
         shared_prefix_scope: str | None = None,
         minimum_shared_prefix_tokens: int = 128,
         prefix_seed_timeout_seconds: float = 600.0,
+        enable_shared_prefixes: bool = True,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -275,6 +276,7 @@ class LlamaCacheProxy:
         self.max_cache_bytes = int(max_cache_gib * 1024**3)
         self.wait_seconds = wait_seconds
         self.enable_prefix_seeding = enable_prefix_seeding
+        self.enable_shared_prefixes = enable_shared_prefixes
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
         if (
             isinstance(prefix_seed_timeout_seconds, bool)
@@ -357,7 +359,7 @@ class LlamaCacheProxy:
                 restored_source = self._restore_first_available(
                     candidate_slot_id, (session_file,), session_ref=session_ref
                 )
-            if restored_source is None:
+            if restored_source is None and self.enable_shared_prefixes:
                 try:
                     request_tokens = self._render_tokens(body)
                     shared = self._best_shared_prefix(request_tokens)
@@ -404,6 +406,7 @@ class LlamaCacheProxy:
                             rejected_shared_source = shared_source
             if (
                 restored_source is None
+                and self.enable_shared_prefixes
                 and rejected_shared_source is None
                 and self.shared_prefix_scope == "default"
                 and prefix_file.exists()
@@ -739,7 +742,7 @@ class LlamaCacheProxy:
         return payload
 
     def _schedule_prefix_seed(self, plan: SnapshotPlan) -> None:
-        if not self.enable_prefix_seeding:
+        if not self.enable_shared_prefixes or not self.enable_prefix_seeding:
             return
         # llama.cpp chat templates require at least one message. A tools-only
         # stable prefix cannot be rendered safely and must remain a cold miss.
@@ -1565,6 +1568,7 @@ def main() -> None:
         max_cache_gib=float(os.environ.get("PI_LLAMA_CACHE_MAX_GIB", "12")),
         wait_seconds=float(os.environ.get("PI_LLAMA_CACHE_WAIT_SECONDS", "120")),
         enable_prefix_seeding=_env_bool("PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING", True),
+        enable_shared_prefixes=_env_bool("PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES", True),
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
         prefix_seed_timeout_seconds=float(
             os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT", "600")

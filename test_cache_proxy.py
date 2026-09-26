@@ -281,6 +281,28 @@ class CacheProxyTests(unittest.TestCase):
         Path(self.tempdir.name, manifest_filename(name)).write_text(manifest.to_json())
         return snapshot
 
+    def test_shared_prefixes_can_be_disabled_for_session_snapshot_only_backends(self):
+        session_only = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            enable_prefix_seeding=False,
+            enable_shared_prefixes=False,
+        )
+        self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
+        legacy = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
+        legacy.write_bytes(b"legacy")
+        session_only._render_tokens = Mock(side_effect=AssertionError("prompt APIs must not be called"))
+        session_only._restore = Mock(return_value=3)
+
+        request, plan = session_only.prepare(self.body, "new-session")
+
+        self.assertNotIn("id_slot", request)
+        self.assertIsNone(plan.slot_id)
+        self.assertFalse(plan.prefix_was_present)
+        self.assertIsNone(plan.stable_prefix_seed_tokens)
+        session_only._render_tokens.assert_not_called()
+        session_only._restore.assert_not_called()
+
     def test_prepare_seeds_verified_lcp_instead_of_restoring_divergent_snapshot(self):
         short = self._write_shared("local-llm-prefix-short.bin", [1, 2])
         longest = self._write_shared("local-llm-prefix-long.bin", [1, 2, 3, 4])

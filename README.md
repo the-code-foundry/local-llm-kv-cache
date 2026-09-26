@@ -36,6 +36,7 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 | --- | ---: | --- |
 | `PI_LLAMA_CACHE_NAMESPACE` | `default` | Invalidates snapshots when the model, llama.cpp, context, or template changes. Use a stable deployment fingerprint. |
 | `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Enables opportunistic seeding of shared reference prefixes. `-np 1` mode is supported through the transactional swap described below. |
+| `PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES` | `true` | Enables shared-prefix discovery and restore. Set to `false` for session-snapshot-only backends that do not expose `/apply-template` and `/tokenize`, such as QwFNfer snapshot format v1. |
 | `PI_LLAMA_CACHE_PREFIX_SEED_DELAY` | `2` | Delay in seconds between a successful response and the start of background seeding. The operation is deferred if a foreground request is waiting. |
 | `PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT` | `600` | HTTP timeout reserved for the seeding `/completion`, in seconds. It must exceed the cold prefill time of the complete stable prefix. It does not change the 120-second timeout of other internal APIs and must be strictly positive. |
 | `PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE` | `default` | Isolation domain for shared prefixes. Personal and work environments must use distinct explicit values, for example `personal` and `work`. |
@@ -45,6 +46,28 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 | `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshots. A successful restore or hot reuse updates recency. |
 
 The `terminal` policy is intended for agents that chain many tool calls. Deferred state remains in the hot slot and is saved before a cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy takes the safe path and saves immediately.
+
+### QwFNfer session snapshots
+
+QwFNfer snapshot format v1 implements the same single-slot save/restore contract,
+but deliberately supports exact session continuation only. Run the proxy on the
+same host as QwFNfer, point `PI_LLAMA_CACHE_DIR` at the directory passed to
+`qwfn-server --snapshot-dir`, and isolate its archive namespace from llama.cpp:
+
+```ini
+PI_LLAMA_UPSTREAM=http://127.0.0.1:18080
+PI_LLAMA_CACHE_DIR=/var/lib/qwfnfer/snapshots
+PI_LLAMA_CACHE_NAMESPACE=qwfnfer-qwen38-flash-next-q4-192k-v1
+PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES=false
+PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=false
+PI_LLAMA_CACHE_SAVE_POLICY=terminal
+PI_LLAMA_CACHE_REQUIRE_SESSION_ID=true
+```
+
+The QwFNfer archive contains its own model/configuration fingerprint and SHA-256
+integrity envelope. It is not compatible with llama.cpp `.bin` slot files. A
+restore is useful only when the next prompt is an exact extension of the saved
+token sequence; QwFNfer resets and fully prefills on any divergence.
 
 ### Concurrent slot safety
 
