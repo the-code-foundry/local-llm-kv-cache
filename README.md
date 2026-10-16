@@ -1,5 +1,7 @@
 # Local KV Cache for LLMs
 
+The Code Foundry fork — [changes versus the original repo](./tcf.md).
+
 This project adds a persistent KV cache to Hermes Agent and local OpenAI-compatible clients, notably Pi and Zed. It combines two mechanisms:
 
 1. an in-memory hot cache, which directly reuses a llama.cpp slot to continue the same session;
