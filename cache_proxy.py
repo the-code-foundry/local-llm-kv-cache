@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import threading
 import time
@@ -75,6 +76,142 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+@dataclass(frozen=True)
+class KvControls:
+    """Per-request cache behaviour, resolved header > body > inline tag > env."""
+
+    save: bool = True
+    restore: bool = True
+    save_growth: int = 0
+    restore_tokens: int = 0
+
+
+_KV_CONTROL_KEYS = ("save", "restore", "save-growth", "restore-tokens")
+_KV_BOOL_KEYS = {"save", "restore"}
+
+
+def _parse_kv_value(key: str, raw: str) -> bool | int | None:
+    """Parse one control value; None (with a log) for anything invalid."""
+    value = raw.strip().lower()
+    if key in _KV_BOOL_KEYS:
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    else:
+        try:
+            parsed = int(value)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    _log_event(
+        "kv_control_invalid",
+        level=logging.WARNING,
+        key=key,
+        value=raw.strip(),
+    )
+    return None
+
+
+def _kv_tag_pattern(inline_prefix: str) -> re.Pattern[str]:
+    return re.compile(
+        r"\[\[\s*" + re.escape(inline_prefix) + r"x-kv-([a-z][a-z-]*)\s*:\s*([^\[\]]*?)\s*\]\]",
+        re.IGNORECASE,
+    )
+
+
+def _strip_kv_tags_from_text(text: str, pattern: re.Pattern[str], found: dict[str, bool | int]) -> str:
+    def _consume(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        if key in _KV_CONTROL_KEYS:
+            value = _parse_kv_value(key, match.group(2))
+            if value is not None:
+                found[key] = value
+        else:
+            _log_event("kv_tag_unknown", level=logging.WARNING, key=key)
+        return ""
+
+    return pattern.sub(_consume, text)
+
+
+def _extract_kv_tags(body: dict[str, Any], inline_prefix: str) -> dict[str, bool | int]:
+    """Collect and strip ``[[x-kv-*: ...]]`` tags from the messages a request
+    owner controls: every system message and the first non-system message.
+    Tags elsewhere are ordinary content and are forwarded untouched. ``body``
+    is mutated in place and must already be a private copy."""
+    pattern = _kv_tag_pattern(inline_prefix)
+    found: dict[str, bool | int] = {}
+    saw_first_non_system = False
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        is_system = message.get("role") == "system"
+        if not is_system:
+            if saw_first_non_system:
+                break
+            saw_first_non_system = True
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = _strip_kv_tags_from_text(content, pattern, found)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    part["text"] = _strip_kv_tags_from_text(part["text"], pattern, found)
+    return found
+
+
+def _extract_kv_body_fields(body: dict[str, Any]) -> dict[str, bool | int]:
+    """Collect and strip ``kv_save``-style fields from the body and its
+    ``extra_body``. ``body`` is mutated in place and must be a private copy."""
+    found: dict[str, bool | int] = {}
+    containers = [body]
+    extra_body = body.get("extra_body")
+    if isinstance(extra_body, dict):
+        containers.append(extra_body)
+    for container in containers:
+        for key in _KV_CONTROL_KEYS:
+            field_name = "kv_" + key.replace("-", "_")
+            if field_name not in container:
+                continue
+            raw = container.pop(field_name)
+            value = _parse_kv_value(key, str(raw))
+            if value is not None and key not in found:
+                found[key] = value
+    if isinstance(extra_body, dict) and not extra_body:
+        body.pop("extra_body", None)
+    return found
+
+
+def _extract_kv_headers(headers: Any) -> dict[str, bool | int]:
+    found: dict[str, bool | int] = {}
+    for key in _KV_CONTROL_KEYS:
+        header_name = "X-KV-" + "-".join(part.capitalize() for part in key.split("-"))
+        raw = headers.get(header_name)
+        if raw is None:
+            continue
+        value = _parse_kv_value(key, raw)
+        if value is not None:
+            found[key] = value
+    return found
+
+
+def _resolve_kv_controls(
+    defaults: KvControls,
+    *channels: dict[str, bool | int],
+) -> KvControls:
+    """Resolve per-request controls; earlier channels win over later ones."""
+    resolved: dict[str, bool | int] = {}
+    for channel in reversed(channels):
+        resolved.update(channel)
+    return KvControls(
+        save=bool(resolved.get("save", defaults.save)),
+        restore=bool(resolved.get("restore", defaults.restore)),
+        save_growth=int(resolved.get("save-growth", defaults.save_growth)),
+        restore_tokens=int(resolved.get("restore-tokens", defaults.restore_tokens)),
+    )
 
 
 def _is_slot_admin_path(path: str) -> bool:
@@ -234,6 +371,9 @@ class SlotState:
     n_tokens: int
     session_file: Path | None = None
     dirty: bool = False
+    # Token count of the session snapshot actually on disk; growth for
+    # kv-save-growth is measured against this, not against the hot slot.
+    saved_n_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +404,8 @@ class LlamaCacheProxy:
         prefix_seed_timeout_seconds: float = 600.0,
         enable_shared_prefixes: bool = True,
         anonymous_affinity: str = "project",
+        kv_controls: KvControls | None = None,
+        inline_prefix: str = "",
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -281,6 +423,10 @@ class LlamaCacheProxy:
         if anonymous_affinity not in {"project", "conversation-start"}:
             raise ValueError("anonymous_affinity must be 'project' or 'conversation-start'")
         self.anonymous_affinity = anonymous_affinity
+        self.kv_controls = kv_controls or KvControls()
+        if self.kv_controls.save_growth < 0 or self.kv_controls.restore_tokens < 0:
+            raise ValueError("kv_controls thresholds must be non-negative")
+        self.inline_prefix = inline_prefix
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
         if (
             isinstance(prefix_seed_timeout_seconds, bool)
@@ -332,12 +478,21 @@ class LlamaCacheProxy:
         *,
         excluded_slot_ids: set[int] | None = None,
         wait_for_slot: bool = True,
+        controls: KvControls | None = None,
     ) -> tuple[dict[str, Any], SnapshotPlan]:
+        controls = controls or self.kv_controls
         prefix_key = cache_key(body)
         session_file = self.cache_dir / cache_filename(session_id, body, "session")
         prefix_file = self.cache_dir / cache_filename("prefix", body, "prefix")
         prefix_payload = build_prefix_payload(body)
         session_ref = _session_ref(session_id)
+        if not controls.save:
+            # A deferred (dirty) state extended by a no-save request would later
+            # be flushed with that request's content included. Persist the
+            # deferred state first so the no-save request stays disposable.
+            state = self.session_states.get(session_id)
+            if state is not None and state.dirty:
+                self._flush_dirty_states("before_no_save_request")
         hot_state = self._hot_state(self.session_states.get(session_id), prefix_key)
         restored_source = None
         candidate_slot_id = None
@@ -358,12 +513,32 @@ class LlamaCacheProxy:
             # owner before allowing llama.cpp to overwrite one.
             self._flush_dirty_states("before_eviction", excluded_slot_ids)
             candidate_slot_id = self._wait_for_idle_slot(excluded_slot_ids, wait=wait_for_slot)
-            if session_file.exists():
-                self._forget_slot(candidate_slot_id)
-                restored_source = self._restore_first_available(
-                    candidate_slot_id, (session_file,), session_ref=session_ref
+            if not controls.restore:
+                _log_event("kv_restore_disabled", session_ref=session_ref)
+            if controls.restore and session_file.exists():
+                previous_state = self.session_states.get(session_id)
+                known_snapshot_tokens = (
+                    previous_state.saved_n_tokens
+                    if previous_state is not None and previous_state.session_file == session_file
+                    else None
                 )
-            if restored_source is None and self.enable_shared_prefixes:
+                if (
+                    controls.restore_tokens > 0
+                    and known_snapshot_tokens is not None
+                    and known_snapshot_tokens < controls.restore_tokens
+                ):
+                    _log_event(
+                        "kv_restore_below_threshold",
+                        session_ref=session_ref,
+                        snapshot_tokens=known_snapshot_tokens,
+                        threshold=controls.restore_tokens,
+                    )
+                else:
+                    self._forget_slot(candidate_slot_id)
+                    restored_source = self._restore_first_available(
+                        candidate_slot_id, (session_file,), session_ref=session_ref
+                    )
+            if restored_source is None and controls.restore and self.enable_shared_prefixes:
                 try:
                     request_tokens = self._render_tokens(body)
                     shared = self._best_shared_prefix(request_tokens)
@@ -375,6 +550,18 @@ class LlamaCacheProxy:
                         session_ref=session_ref,
                         error_type=type(error).__name__,
                     )
+                if (
+                    shared is not None
+                    and controls.restore_tokens > 0
+                    and shared[1] < controls.restore_tokens
+                ):
+                    _log_event(
+                        "kv_restore_below_threshold",
+                        session_ref=session_ref,
+                        snapshot_tokens=shared[1],
+                        threshold=controls.restore_tokens,
+                    )
+                    shared = None
                 if shared is not None:
                     shared_source, candidate_tokens, verified_lcp = shared
                     if verified_lcp < candidate_tokens:
@@ -410,6 +597,7 @@ class LlamaCacheProxy:
                             rejected_shared_source = shared_source
             if (
                 restored_source is None
+                and controls.restore
                 and self.enable_shared_prefixes
                 and rejected_shared_source is None
                 and self.shared_prefix_scope == "default"
@@ -596,20 +784,54 @@ class LlamaCacheProxy:
         cached_tokens: int | None = None,
         *,
         prune: bool = True,
+        controls: KvControls | None = None,
     ) -> None:
         if status < 200 or status >= 300:
             return
+        controls = controls or self.kv_controls
         slot_id = self._resolve_slot(plan)
         if plan.slot_id is None:
             self._forget_slot(slot_id)
 
         session_ref = _session_ref(plan.session_id)
+        if not controls.save:
+            # The request's state is disposable: no save, no deferral, and no
+            # session-state update, so the next request restores the snapshot
+            # already on disk instead of continuing from this slot.
+            _log_event(
+                "request_complete",
+                session_ref=session_ref,
+                slot_id=slot_id,
+                finish_reason=finish_reason,
+                cached_tokens=cached_tokens,
+                snapshot_saved=False,
+                kv_save="disabled",
+            )
+            if not plan.prefix_was_present:
+                self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
+            self._retry_pending_prefix_seeds()
+            return
+        previous = self.session_states.get(plan.session_id)
+        previous_saved_tokens = (
+            previous.saved_n_tokens
+            if previous is not None
+            and previous.prefix_key == plan.prefix_key
+            and previous.session_file == plan.session_file
+            else None
+        )
         defer = self.save_policy == "terminal" and finish_reason == "tool_calls"
         did_save = False
         if defer:
             n_tokens = self._slot_token_count(slot_id)
             if n_tokens > 0:
-                state = SlotState(slot_id, plan.prefix_key, n_tokens, plan.session_file, True)
+                state = SlotState(
+                    slot_id,
+                    plan.prefix_key,
+                    n_tokens,
+                    plan.session_file,
+                    True,
+                    saved_n_tokens=previous_saved_tokens,
+                )
                 _log_event(
                     "snapshot_deferred",
                     session_ref=session_ref,
@@ -627,8 +849,31 @@ class LlamaCacheProxy:
                     reason="metadata_fallback",
                     session_ref=session_ref,
                 )
-                state = SlotState(slot_id, plan.prefix_key, n_saved, plan.session_file, False)
+                state = SlotState(
+                    slot_id, plan.prefix_key, n_saved, plan.session_file, False, saved_n_tokens=n_saved
+                )
                 did_save = True
+        elif self._should_skip_save(previous_saved_tokens, plan, slot_id, controls.save_growth):
+            # The slot grew too little to be worth rewriting a multi-GB file.
+            # The state stays dirty so eviction and shutdown still persist it,
+            # and growth keeps being measured against the snapshot on disk.
+            n_tokens = self._slot_token_count(slot_id)
+            state = SlotState(
+                slot_id,
+                plan.prefix_key,
+                n_tokens,
+                plan.session_file,
+                True,
+                saved_n_tokens=previous_saved_tokens,
+            )
+            _log_event(
+                "snapshot_save_skipped",
+                session_ref=session_ref,
+                slot_id=slot_id,
+                tokens=n_tokens,
+                snapshot_tokens=previous_saved_tokens,
+                threshold=controls.save_growth,
+            )
         else:
             n_saved = self._save(
                 slot_id,
@@ -636,7 +881,9 @@ class LlamaCacheProxy:
                 reason="response_complete",
                 session_ref=session_ref,
             )
-            state = SlotState(slot_id, plan.prefix_key, n_saved, plan.session_file, False)
+            state = SlotState(
+                slot_id, plan.prefix_key, n_saved, plan.session_file, False, saved_n_tokens=n_saved
+            )
             did_save = True
         self.session_states[plan.session_id] = state
         _log_event(
@@ -671,6 +918,23 @@ class LlamaCacheProxy:
         if did_save and prune:
             self._prune()
 
+    def _should_skip_save(
+        self,
+        previous_saved_tokens: int | None,
+        plan: SnapshotPlan,
+        slot_id: int,
+        save_growth: int,
+    ) -> bool:
+        if save_growth <= 0 or previous_saved_tokens is None:
+            return False
+        if not plan.session_file.exists():
+            return False
+        current = self._slot_token_count(slot_id)
+        if current <= 0:
+            # Unknown slot metadata must fail safe: save.
+            return False
+        return current - previous_saved_tokens < save_growth
+
     def _slot_token_count(self, slot_id: int) -> int:
         try:
             slots = self._slots()
@@ -699,7 +963,9 @@ class LlamaCacheProxy:
                 reason=reason,
                 session_ref=session_ref,
             )
-            self.session_states[session_id] = replace(state, n_tokens=n_saved, dirty=False)
+            self.session_states[session_id] = replace(
+                state, n_tokens=n_saved, dirty=False, saved_n_tokens=n_saved
+            )
             _log_event(
                 "snapshot_flush",
                 session_ref=session_ref,
@@ -982,6 +1248,7 @@ class LlamaCacheProxy:
         self,
         body: dict[str, Any],
         session_id: str,
+        controls: KvControls | None = None,
     ) -> tuple[dict[str, Any], SnapshotPlan]:
         """Atomically prepare and reserve one slot for a managed request."""
         deadline = time.monotonic() + self.wait_seconds
@@ -993,6 +1260,7 @@ class LlamaCacheProxy:
                         session_id,
                         excluded_slot_ids=self.active_slot_ids | self.seed_slot_ids,
                         wait_for_slot=False,
+                        controls=controls,
                     )
                 except _NoIdleSlot:
                     pass
@@ -1018,12 +1286,13 @@ class LlamaCacheProxy:
         status: int,
         finish_reason: str | None = None,
         cached_tokens: int | None = None,
+        controls: KvControls | None = None,
     ) -> None:
         """Finalize a request before releasing its reserved slot."""
         with self.operation_lock:
             finalized = False
             try:
-                self.finish(plan, status, finish_reason, cached_tokens, prune=False)
+                self.finish(plan, status, finish_reason, cached_tokens, prune=False, controls=controls)
                 finalized = 200 <= status < 300
             finally:
                 if (
@@ -1523,6 +1792,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         header_session_id = _session_id(self)
         body_session_id = _body_session_id(body)
         body = _without_proxy_affinity_fields(body)
+        kv_channels = (
+            _extract_kv_headers(self.headers),
+            _extract_kv_body_fields(body),
+            _extract_kv_tags(body, getattr(self.proxy, "inline_prefix", "")),
+        )
+        kv_controls = _resolve_kv_controls(
+            getattr(self.proxy, "kv_controls", KvControls()), *kv_channels
+        )
         if _has_media(body):
             try:
                 with self.proxy.foreground_operation():
@@ -1548,7 +1825,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         reservation_released = False
         try:
             with self.proxy.session_operation(session_id):
-                request, plan = self.proxy.begin_request(body, session_id)
+                request, plan = self.proxy.begin_request(body, session_id, kv_controls)
                 try:
                     result = self.proxy.forward(
                         self,
@@ -1565,6 +1842,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             result.status,
                             finish_reason=result.metadata.finish_reason,
                             cached_tokens=result.metadata.cached_tokens,
+                            controls=kv_controls,
                         )
                     except Exception:
                         LOGGER.exception("response succeeded but snapshot finalization failed")
@@ -1587,6 +1865,15 @@ def main() -> None:
         level=os.environ.get("PI_LLAMA_CACHE_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # Generic (client-agnostic) settings use bare KV_* names; the optional
+    # prefix exists for shared environments where those would collide.
+    env_prefix = os.environ.get("LOCAL_LLM_KV_CACHE_ENV_PREFIX", "").strip()
+    kv_controls = KvControls(
+        save=_env_bool(f"{env_prefix}KV_SAVE", True),
+        restore=_env_bool(f"{env_prefix}KV_RESTORE", True),
+        save_growth=int(os.environ.get(f"{env_prefix}KV_SAVE_GROWTH", "0")),
+        restore_tokens=int(os.environ.get(f"{env_prefix}KV_RESTORE_TOKENS", "0")),
+    )
     proxy = LlamaCacheProxy(
         upstream=os.environ.get("PI_LLAMA_UPSTREAM", "http://127.0.0.1:8080"),
         cache_dir=os.environ.get("PI_LLAMA_CACHE_DIR", DEFAULT_CACHE_DIR),
@@ -1605,6 +1892,8 @@ def main() -> None:
         minimum_shared_prefix_tokens=int(
             os.environ.get("PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS", "128")
         ),
+        kv_controls=kv_controls,
+        inline_prefix=os.environ.get("LOCAL_LLM_KV_CACHE_INLINE_PREFIX", "").strip(),
     )
     ProxyHandler.proxy = proxy
     host = os.environ.get("PI_LLAMA_CACHE_HOST", "127.0.0.1")

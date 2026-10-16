@@ -48,6 +48,48 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 
 The `terminal` policy is intended for agents that chain many tool calls. Deferred state remains in the hot slot and is saved before a cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy takes the safe path and saves immediately.
 
+### Per-request cache controls
+
+Four generic controls decide whether and when this proxy reads and writes snapshots.
+Each exists in four channels with the same key words; precedence is
+**header > body field > inline tag > environment default**.
+
+| key | type | env default | meaning |
+| --- | --- | ---: | --- |
+| `kv-save` | bool | `KV_SAVE=true` | Save a snapshot after this request. When `false`, nothing is written and the session state is not updated, so the next request restores the snapshot already on disk. |
+| `kv-restore` | bool | `KV_RESTORE=true` | Restore a snapshot before this request. When `false`, every disk restore (session, shared prefix, legacy prefix) is skipped; hot slot reuse is unaffected. |
+| `kv-save-growth` | int | `KV_SAVE_GROWTH=0` | Minimum token growth of the slot versus the snapshot on disk before the snapshot is rewritten. Skipped saves leave the state dirty, so eviction and shutdown still persist it. `0` always saves. |
+| `kv-restore-tokens` | int | `KV_RESTORE_TOKENS=0` | Minimum snapshot size, in tokens, worth restoring from disk. Applies where the token count is known: shared-prefix manifests, and session snapshots this proxy process has saved. `0` always restores. |
+
+Channels, by example for `kv-save`:
+
+- header: `X-KV-Save: false`
+- body field: `"kv_save": false` (top level or inside `extra_body`; stripped before forwarding)
+- inline tag: `[[x-kv-save: false]]` in message content
+- environment: `KV_SAVE=false` (the deployment default)
+
+Inline tags are recognized only in system messages and in the first non-system
+message — the positions the conversation owner controls — and are stripped from
+those positions before the request is forwarded, so the model never sees them and
+the forwarded token stream stays identical whether a tag was present or not. Tags
+in later messages are ordinary content and are forwarded untouched. Unknown
+`x-kv-*` tags in scanned positions are stripped and logged. Invalid values in any
+channel are logged and ignored, falling through to the next channel.
+
+Two optional prefixes, both read once at startup:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `LOCAL_LLM_KV_CACHE_ENV_PREFIX` | empty | Prefix for the four `KV_*` variables on shared hosts where the bare names would collide. With `MYAPP_`, only `MYAPP_KV_SAVE` etc. are read. |
+| `LOCAL_LLM_KV_CACHE_INLINE_PREFIX` | empty | Prefix for inline tags. With `b7-`, only `[[b7-x-kv-save: ...]]` is recognized and stripped; a bare `[[x-kv-save: ...]]` becomes ordinary content. This doubles as a weak capability: only clients that know the prefix can change cache behaviour from message content. Change it together with `PI_LLAMA_CACHE_NAMESPACE`. |
+
+The typical fan-out pattern — compute one shared base conversation, then run
+several independent tasks on top of it without the tasks overwriting the base
+snapshot: send the base conversation with a session ID once (saved normally),
+then send each `base + task` request with the same session ID and `kv-save:
+false`. Each task restores the base snapshot, llama.cpp processes only the task
+tokens, and the base snapshot stays untouched.
+
 ### QwFNfer session snapshots
 
 QwFNfer snapshot format v1 implements the same single-slot save/restore contract,

@@ -91,7 +91,7 @@ class UnavailableProxy:
     def session_operation(self, _session_id):
         yield
 
-    def begin_request(self, body, session_id):
+    def begin_request(self, body, session_id, controls=None):
         return self.prepare(body, session_id)
 
     def prepare(self, *_args):
@@ -118,7 +118,7 @@ class CapturingProxy:
         self.session_ids.append(session_id)
         return body, None
 
-    def begin_request(self, body, session_id):
+    def begin_request(self, body, session_id, controls=None):
         return self.prepare(body, session_id)
 
     def prepare_uncached(self, reason):
@@ -2895,6 +2895,260 @@ class CacheProxyTests(unittest.TestCase):
             self.assertEqual(response.status, 400)
         finally:
             connection.close()
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
+
+
+class KvControlParsingTests(unittest.TestCase):
+    def test_tag_is_stripped_from_system_and_first_message_only(self):
+        body = {
+            "messages": [
+                {"role": "system", "content": "rules [[x-kv-save: false]] more"},
+                {"role": "user", "content": "[[x-kv-save-growth: 4096]] question"},
+                {"role": "user", "content": "later [[x-kv-restore: false]] message"},
+            ]
+        }
+        found = cache_proxy._extract_kv_tags(body, "")
+        self.assertEqual(found, {"save": False, "save-growth": 4096})
+        self.assertEqual(body["messages"][0]["content"], "rules  more")
+        self.assertEqual(body["messages"][1]["content"], " question")
+        self.assertEqual(body["messages"][2]["content"], "later [[x-kv-restore: false]] message")
+
+    def test_tag_in_text_part_of_content_list(self):
+        body = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "a [[x-kv-restore: false]] b"}],
+                }
+            ]
+        }
+        found = cache_proxy._extract_kv_tags(body, "")
+        self.assertEqual(found, {"restore": False})
+        self.assertEqual(body["messages"][0]["content"][0]["text"], "a  b")
+
+    def test_inline_prefix_gates_tag_recognition(self):
+        body = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "[[x-kv-save: false]] [[b7-x-kv-save: false]]",
+                }
+            ]
+        }
+        found = cache_proxy._extract_kv_tags(body, "b7-")
+        self.assertEqual(found, {"save": False})
+        self.assertEqual(body["messages"][0]["content"], "[[x-kv-save: false]] ")
+
+    def test_unknown_tag_key_is_stripped_and_invalid_value_ignored(self):
+        body = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "[[x-kv-frobnicate: 1]] [[x-kv-save-growth: lots]]",
+                }
+            ]
+        }
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            found = cache_proxy._extract_kv_tags(body, "")
+        self.assertEqual(found, {})
+        self.assertEqual(body["messages"][0]["content"], " ")
+        rendered = str(log.call_args_list)
+        self.assertIn("kv_tag_unknown", rendered)
+        self.assertIn("kv_control_invalid", rendered)
+
+    def test_body_fields_are_collected_and_stripped(self):
+        body = {
+            "kv_save": "false",
+            "kv_restore_tokens": 256,
+            "extra_body": {"kv_save_growth": "1024"},
+            "messages": [],
+        }
+        found = cache_proxy._extract_kv_body_fields(body)
+        self.assertEqual(found, {"save": False, "restore-tokens": 256, "save-growth": 1024})
+        self.assertNotIn("kv_save", body)
+        self.assertNotIn("kv_restore_tokens", body)
+        self.assertNotIn("extra_body", body)
+
+    def test_headers_are_collected(self):
+        handler = RecordingHandler(
+            headers={"X-KV-Save": "off", "X-KV-Restore-Tokens": "128", "X-KV-Save-Growth": "bad"}
+        )
+        found = cache_proxy._extract_kv_headers(handler.headers)
+        self.assertEqual(found, {"save": False, "restore-tokens": 128})
+
+    def test_resolution_precedence_header_body_tag_env(self):
+        defaults = cache_proxy.KvControls(save_growth=10)
+        resolved = cache_proxy._resolve_kv_controls(
+            defaults,
+            {"save": True},
+            {"save": False, "restore": False},
+            {"save": True, "restore": True, "restore-tokens": 7},
+        )
+        self.assertTrue(resolved.save)
+        self.assertFalse(resolved.restore)
+        self.assertEqual(resolved.restore_tokens, 7)
+        self.assertEqual(resolved.save_growth, 10)
+
+    def test_negative_thresholds_are_rejected(self):
+        for kwargs in ({"save_growth": -1}, {"restore_tokens": -1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                LlamaCacheProxy(
+                    upstream="http://127.0.0.1:1",
+                    cache_dir=tempfile.mkdtemp(),
+                    kv_controls=cache_proxy.KvControls(**kwargs),
+                )
+
+
+class KvControlsProxyTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        FakeLlamaHandler.cache_dir = self.tempdir.name
+        FakeLlamaHandler.restored = []
+        FakeLlamaHandler.saved = []
+        FakeLlamaHandler.restore_failed = False
+        FakeLlamaHandler.restore_tokens = 10
+        FakeLlamaHandler.slot_tokens = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLlamaHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.proxy = self._proxy()
+        self.body = {
+            "model": "qwen3.8:27b",
+            "messages": [
+                {"role": "system", "content": "project rules"},
+                {"role": "user", "content": "request"},
+            ],
+            "tools": [],
+        }
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def _proxy(self, **kwargs):
+        return LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            max_cache_gib=1,
+            wait_seconds=1,
+            enable_prefix_seeding=False,
+            **kwargs,
+        )
+
+    def test_save_disabled_skips_save_and_session_state(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200, controls=cache_proxy.KvControls(save=False))
+
+        self.assertEqual(FakeLlamaHandler.saved, [])
+        self.assertNotIn("session-a", self.proxy.session_states)
+
+    def test_save_disabled_flushes_deferred_state_before_request(self):
+        terminal = self._proxy(save_policy="terminal")
+        _, plan = terminal.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 10
+        terminal.finish(plan, 200, finish_reason="tool_calls")
+        self.assertTrue(terminal.session_states["session-a"].dirty)
+        saved_before = len(FakeLlamaHandler.saved)
+
+        terminal.prepare(self.body, "session-a", controls=cache_proxy.KvControls(save=False))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), saved_before + 1)
+        self.assertFalse(terminal.session_states["session-a"].dirty)
+
+    def test_restore_disabled_starts_cold_despite_snapshot(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+
+        cold = self._proxy()
+        _, cold_plan = cold.prepare(
+            self.body, "session-a", controls=cache_proxy.KvControls(restore=False)
+        )
+
+        self.assertEqual(FakeLlamaHandler.restored, [])
+        self.assertIsNone(cold_plan.slot_id)
+
+    def test_save_growth_skips_small_rewrite_and_flush_persists_it(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        state = self.proxy.session_states["session-a"]
+        self.assertEqual(state.saved_n_tokens, 10)
+
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+        self.assertEqual(hot_plan.slot_id, 0)
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(hot_plan, 200, controls=cache_proxy.KvControls(save_growth=4096))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        state = self.proxy.session_states["session-a"]
+        self.assertTrue(state.dirty)
+        self.assertEqual(state.n_tokens, 12)
+        self.assertEqual(state.saved_n_tokens, 10)
+
+        self.proxy.flush_dirty("test")
+        self.assertEqual(len(FakeLlamaHandler.saved), 2)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_save_growth_reached_saves_normally(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(hot_plan, 200, controls=cache_proxy.KvControls(save_growth=2))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 2)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_restore_tokens_threshold_skips_known_small_session_snapshot(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        # Invalidate the hot slot so the next prepare takes the cold path.
+        FakeLlamaHandler.slot_tokens = 99
+
+        _, cold_plan = self.proxy.prepare(
+            self.body, "session-a", controls=cache_proxy.KvControls(restore_tokens=100)
+        )
+
+        self.assertEqual(FakeLlamaHandler.restored, [])
+        self.assertIsNone(cold_plan.slot_id)
+
+    def test_handler_applies_tag_controls_end_to_end(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        ProxyHandler.proxy = self.proxy
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            body = {
+                "model": "qwen3.8:27b",
+                "messages": [
+                    {"role": "system", "content": "project rules [[x-kv-save: false]]"},
+                    {"role": "user", "content": "request"},
+                ],
+                "tools": [],
+            }
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps(body),
+                    headers={"Content-Type": "application/json", "X-Session-Id": "session-tag"},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+            finally:
+                connection.close()
+            self.assertEqual(FakeLlamaHandler.saved, [])
+            self.assertNotIn("session-tag", self.proxy.session_states)
+        finally:
             server.shutdown()
             server.server_close()
             if previous_proxy is None:

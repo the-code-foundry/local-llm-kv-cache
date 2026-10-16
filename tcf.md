@@ -1,11 +1,48 @@
 # The Code Foundry fork — changes versus the original repo
 
 This repository is The Code Foundry's fork of
-[gbuisson/local-llm-kv-cache](https://github.com/gbuisson/local-llm-kv-cache).
+[gbuisson/local-llm-kv-cache](https://github.com/gbuisson/local-llm-kv-cache),
+forked at upstream `v0.2.0` (commit `2ffb14c`).
 
 ## Changes
 
-None yet. The fork is currently identical to upstream (`v0.2.0`, commit `2ffb14c`).
+Newest first.
 
-Changes made in this fork will be listed here, newest first, with a short
-description and the motivation for each.
+### Per-request cache controls (`kv-save`, `kv-restore`, `kv-save-growth`, `kv-restore-tokens`)
+
+Four generic controls over snapshot reads and writes, each available as a
+header (`X-KV-Save`), a body field (`kv_save`), an inline message tag
+(`[[x-kv-save: false]]`) and an environment default (`KV_SAVE`); precedence
+header > body > tag > env. See "Per-request cache controls" in the README.
+
+- `kv-save: false` makes a request disposable: nothing is written, the session
+  state is not updated. Built for fan-out — restore one shared base snapshot
+  for several independent tasks without any of them overwriting it.
+- `kv-restore: false` skips all disk restores for one request.
+- `kv-save-growth` is a port of upstream's
+  `fix/prune-tmp-and-raise-cache-limit` idea (there:
+  `PI_LLAMA_CACHE_MIN_SAVE_GROWTH`) onto the multi-slot main: skip rewriting a
+  multi-GB snapshot until the slot has grown by this many tokens. Divergences
+  from that branch: renamed to the generic `KV_SAVE_GROWTH`, and a skipped
+  save marks the session state dirty, so hot reuse keeps working and eviction,
+  shutdown and `before_eviction` flushes still persist the unsaved tokens.
+  (The branch's other fix, pruning orphaned `.tmp` snapshots, is already in
+  upstream main.)
+- `kv-restore-tokens` skips disk restores of snapshots smaller than this many
+  tokens, where the token count is known (shared-prefix manifests, and session
+  snapshots saved by the running process).
+- `LOCAL_LLM_KV_CACHE_ENV_PREFIX` namespaces the `KV_*` env vars on shared
+  hosts; `LOCAL_LLM_KV_CACHE_INLINE_PREFIX` namespaces the inline tags and
+  doubles as a weak capability for who may control caching from content.
+- Inline tags are recognized only in system messages and the first non-system
+  message, and are stripped before forwarding, so the forwarded token stream —
+  and therefore prefix matching — is identical with or without tags.
+
+### Cherry-picked from upstream `feature/qwfnfer-session-snapshots`
+
+Two upstream commits not yet in upstream main (`f42a76b`, `0a82133`):
+`PI_LLAMA_CACHE_ENABLE_SHARED_PREFIXES=false` for session-snapshot-only
+backends, and `PI_LLAMA_CACHE_ANONYMOUS_AFFINITY=conversation-start`, which
+keys anonymous sessions on the stable prefix plus the first non-system message
+so concurrent conversations that share a system prompt do not fight over one
+snapshot.
