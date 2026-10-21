@@ -50,7 +50,7 @@ The `terminal` policy is intended for agents that chain many tool calls. Deferre
 
 ### Per-request cache controls
 
-Four generic controls decide whether and when this proxy reads and writes snapshots.
+Five generic controls decide whether and when this proxy reads and writes snapshots.
 Each exists in four channels with the same key words; precedence is
 **header > body field > inline tag > environment default**.
 
@@ -59,6 +59,7 @@ Each exists in four channels with the same key words; precedence is
 | `kv-save` | bool | `KV_SAVE=true` | Save a snapshot after this request. When `false`, nothing is written and the session state is not updated, so the next request restores the snapshot already on disk. |
 | `kv-restore` | bool | `KV_RESTORE=true` | Restore a snapshot before this request. When `false`, every disk restore (session, shared prefix, legacy prefix) is skipped; hot slot reuse is unaffected. |
 | `kv-save-growth` | int | `KV_SAVE_GROWTH=0` | Minimum token growth of the slot versus the snapshot on disk before the snapshot is rewritten. Skipped saves leave the state dirty, so eviction and shutdown still persist it. `0` always saves. |
+| `kv-save-interval` | int | `KV_SAVE_INTERVAL=0` | Minimum seconds since the last persisted save of this session before the snapshot is rewritten. Skipped saves leave the state dirty, like `kv-save-growth`; both gates must pass for a save to happen. Without a recorded save time (e.g. the first save, or after a proxy restart) the proxy saves. `0` disables the gate. |
 | `kv-restore-tokens` | int | `KV_RESTORE_TOKENS=0` | Minimum snapshot size, in tokens, worth restoring from disk. Applies where the token count is known: shared-prefix manifests, and session snapshots this proxy process has saved. `0` always restores. |
 
 Channels, by example for `kv-save`:
@@ -80,7 +81,7 @@ Two optional prefixes, both read once at startup:
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `LOCAL_LLM_KV_CACHE_ENV_PREFIX` | empty | Prefix for the four `KV_*` variables on shared hosts where the bare names would collide. With `MYAPP_`, only `MYAPP_KV_SAVE` etc. are read. |
+| `LOCAL_LLM_KV_CACHE_ENV_PREFIX` | empty | Prefix for the five `KV_*` variables on shared hosts where the bare names would collide. With `MYAPP_`, only `MYAPP_KV_SAVE` etc. are read. |
 | `LOCAL_LLM_KV_CACHE_INLINE_PREFIX` | empty | Prefix for inline tags. With `b7-`, only `[[b7-x-kv-save: ...]]` is recognized and stripped; a bare `[[x-kv-save: ...]]` becomes ordinary content. This doubles as a weak capability: only clients that know the prefix can change cache behaviour from message content. Change it together with `PI_LLAMA_CACHE_NAMESPACE`. |
 
 The typical fan-out pattern — compute one shared base conversation, then run
@@ -89,6 +90,15 @@ snapshot: send the base conversation with a session ID once (saved normally),
 then send each `base + task` request with the same session ID and `kv-save:
 false`. Each task restores the base snapshot, llama.cpp processes only the task
 tokens, and the base snapshot stays untouched.
+
+For long conversations, where rewriting the snapshot after every answer costs
+seconds while holding the session lock, combine the two lazy-save gates:
+`KV_SAVE_INTERVAL=300` with `KV_SAVE_GROWTH=2000` rewrites the multi-GB file at
+most once per five minutes and only once the conversation has grown by 2,000
+tokens; everything in between stays hot in the slot and is still persisted by
+eviction and shutdown flushes. The trade: turns since the last save are lost if
+llama-server dies without a flush, and are then re-processed from the older
+snapshot.
 
 ### QwFNfer session snapshots
 

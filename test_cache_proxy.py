@@ -2995,7 +2995,7 @@ class KvControlParsingTests(unittest.TestCase):
         self.assertEqual(resolved.save_growth, 10)
 
     def test_negative_thresholds_are_rejected(self):
-        for kwargs in ({"save_growth": -1}, {"restore_tokens": -1}):
+        for kwargs in ({"save_growth": -1}, {"save_interval": -1}, {"restore_tokens": -1}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 LlamaCacheProxy(
                     upstream="http://127.0.0.1:1",
@@ -3105,6 +3105,54 @@ class KvControlsProxyTests(unittest.TestCase):
 
         self.assertEqual(len(FakeLlamaHandler.saved), 2)
         self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_save_interval_skips_recent_rewrite_even_with_large_growth(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertIsNotNone(self.proxy.session_states["session-a"].saved_at)
+
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 5000
+        self.proxy.finish(hot_plan, 200, controls=cache_proxy.KvControls(save_interval=3600))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        state = self.proxy.session_states["session-a"]
+        self.assertTrue(state.dirty)
+        self.assertEqual(state.saved_n_tokens, 10)
+
+        self.proxy.flush_dirty("test")
+        self.assertEqual(len(FakeLlamaHandler.saved), 2)
+        state = self.proxy.session_states["session-a"]
+        self.assertFalse(state.dirty)
+        self.assertIsNotNone(state.saved_at)
+
+    def test_save_interval_elapsed_saves_normally(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        state = self.proxy.session_states["session-a"]
+        self.proxy.session_states["session-a"] = replace(state, saved_at=state.saved_at - 120)
+
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(hot_plan, 200, controls=cache_proxy.KvControls(save_interval=60))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 2)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_save_interval_without_recorded_save_time_saves(self):
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(plan, 200)
+        state = self.proxy.session_states["session-a"]
+        # A state without a recorded save time (e.g. carried over a restart)
+        # must fail safe and save.
+        self.proxy.session_states["session-a"] = replace(state, saved_at=None)
+
+        _, hot_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(hot_plan, 200, controls=cache_proxy.KvControls(save_interval=3600))
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 2)
 
     def test_restore_tokens_threshold_skips_known_small_session_snapshot(self):
         _, plan = self.proxy.prepare(self.body, "session-a")

@@ -85,10 +85,11 @@ class KvControls:
     save: bool = True
     restore: bool = True
     save_growth: int = 0
+    save_interval: int = 0
     restore_tokens: int = 0
 
 
-_KV_CONTROL_KEYS = ("save", "restore", "save-growth", "restore-tokens")
+_KV_CONTROL_KEYS = ("save", "restore", "save-growth", "save-interval", "restore-tokens")
 _KV_BOOL_KEYS = {"save", "restore"}
 
 
@@ -210,6 +211,7 @@ def _resolve_kv_controls(
         save=bool(resolved.get("save", defaults.save)),
         restore=bool(resolved.get("restore", defaults.restore)),
         save_growth=int(resolved.get("save-growth", defaults.save_growth)),
+        save_interval=int(resolved.get("save-interval", defaults.save_interval)),
         restore_tokens=int(resolved.get("restore-tokens", defaults.restore_tokens)),
     )
 
@@ -374,6 +376,9 @@ class SlotState:
     # Token count of the session snapshot actually on disk; growth for
     # kv-save-growth is measured against this, not against the hot slot.
     saved_n_tokens: int | None = None
+    # Monotonic time of the last persisted save; the kv-save-interval gate
+    # is measured against this. None (e.g. after a restart) means no gate.
+    saved_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -424,7 +429,11 @@ class LlamaCacheProxy:
             raise ValueError("anonymous_affinity must be 'project' or 'conversation-start'")
         self.anonymous_affinity = anonymous_affinity
         self.kv_controls = kv_controls or KvControls()
-        if self.kv_controls.save_growth < 0 or self.kv_controls.restore_tokens < 0:
+        if (
+            self.kv_controls.save_growth < 0
+            or self.kv_controls.save_interval < 0
+            or self.kv_controls.restore_tokens < 0
+        ):
             raise ValueError("kv_controls thresholds must be non-negative")
         self.inline_prefix = inline_prefix
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
@@ -812,13 +821,13 @@ class LlamaCacheProxy:
             self._retry_pending_prefix_seeds()
             return
         previous = self.session_states.get(plan.session_id)
-        previous_saved_tokens = (
-            previous.saved_n_tokens
-            if previous is not None
+        previous_matches = (
+            previous is not None
             and previous.prefix_key == plan.prefix_key
             and previous.session_file == plan.session_file
-            else None
         )
+        previous_saved_tokens = previous.saved_n_tokens if previous_matches else None
+        previous_saved_at = previous.saved_at if previous_matches else None
         defer = self.save_policy == "terminal" and finish_reason == "tool_calls"
         did_save = False
         if defer:
@@ -831,6 +840,7 @@ class LlamaCacheProxy:
                     plan.session_file,
                     True,
                     saved_n_tokens=previous_saved_tokens,
+                    saved_at=previous_saved_at,
                 )
                 _log_event(
                     "snapshot_deferred",
@@ -850,13 +860,22 @@ class LlamaCacheProxy:
                     session_ref=session_ref,
                 )
                 state = SlotState(
-                    slot_id, plan.prefix_key, n_saved, plan.session_file, False, saved_n_tokens=n_saved
+                    slot_id,
+                    plan.prefix_key,
+                    n_saved,
+                    plan.session_file,
+                    False,
+                    saved_n_tokens=n_saved,
+                    saved_at=time.monotonic(),
                 )
                 did_save = True
-        elif self._should_skip_save(previous_saved_tokens, plan, slot_id, controls.save_growth):
-            # The slot grew too little to be worth rewriting a multi-GB file.
-            # The state stays dirty so eviction and shutdown still persist it,
-            # and growth keeps being measured against the snapshot on disk.
+        elif self._should_skip_save(
+            previous_saved_tokens, previous_saved_at, plan, slot_id, controls.save_growth, controls.save_interval
+        ):
+            # The slot grew too little, or too recently, to be worth rewriting a
+            # multi-GB file. The state stays dirty so eviction and shutdown still
+            # persist it, and growth and age keep being measured against the
+            # snapshot on disk.
             n_tokens = self._slot_token_count(slot_id)
             state = SlotState(
                 slot_id,
@@ -865,6 +884,7 @@ class LlamaCacheProxy:
                 plan.session_file,
                 True,
                 saved_n_tokens=previous_saved_tokens,
+                saved_at=previous_saved_at,
             )
             _log_event(
                 "snapshot_save_skipped",
@@ -873,6 +893,10 @@ class LlamaCacheProxy:
                 tokens=n_tokens,
                 snapshot_tokens=previous_saved_tokens,
                 threshold=controls.save_growth,
+                interval=controls.save_interval or None,
+                age_seconds=(
+                    round(time.monotonic() - previous_saved_at, 3) if previous_saved_at is not None else None
+                ),
             )
         else:
             n_saved = self._save(
@@ -882,7 +906,13 @@ class LlamaCacheProxy:
                 session_ref=session_ref,
             )
             state = SlotState(
-                slot_id, plan.prefix_key, n_saved, plan.session_file, False, saved_n_tokens=n_saved
+                slot_id,
+                plan.prefix_key,
+                n_saved,
+                plan.session_file,
+                False,
+                saved_n_tokens=n_saved,
+                saved_at=time.monotonic(),
             )
             did_save = True
         self.session_states[plan.session_id] = state
@@ -921,19 +951,29 @@ class LlamaCacheProxy:
     def _should_skip_save(
         self,
         previous_saved_tokens: int | None,
+        previous_saved_at: float | None,
         plan: SnapshotPlan,
         slot_id: int,
         save_growth: int,
+        save_interval: int,
     ) -> bool:
-        if save_growth <= 0 or previous_saved_tokens is None:
-            return False
+        """A save is skipped when any enabled gate says it is too early: the
+        growth gate (the slot grew fewer than ``save_growth`` tokens over the
+        snapshot on disk) or the interval gate (the last persisted save was
+        less than ``save_interval`` seconds ago). A gate without a baseline
+        (no snapshot, unknown slot metadata, no recorded save time) never
+        skips: failing safe means saving."""
         if not plan.session_file.exists():
             return False
-        current = self._slot_token_count(slot_id)
-        if current <= 0:
+        if save_growth > 0 and previous_saved_tokens is not None:
+            current = self._slot_token_count(slot_id)
             # Unknown slot metadata must fail safe: save.
-            return False
-        return current - previous_saved_tokens < save_growth
+            if current > 0 and current - previous_saved_tokens < save_growth:
+                return True
+        if save_interval > 0 and previous_saved_at is not None:
+            if time.monotonic() - previous_saved_at < save_interval:
+                return True
+        return False
 
     def _slot_token_count(self, slot_id: int) -> int:
         try:
@@ -964,7 +1004,7 @@ class LlamaCacheProxy:
                 session_ref=session_ref,
             )
             self.session_states[session_id] = replace(
-                state, n_tokens=n_saved, dirty=False, saved_n_tokens=n_saved
+                state, n_tokens=n_saved, dirty=False, saved_n_tokens=n_saved, saved_at=time.monotonic()
             )
             _log_event(
                 "snapshot_flush",
@@ -1872,6 +1912,7 @@ def main() -> None:
         save=_env_bool(f"{env_prefix}KV_SAVE", True),
         restore=_env_bool(f"{env_prefix}KV_RESTORE", True),
         save_growth=int(os.environ.get(f"{env_prefix}KV_SAVE_GROWTH", "0")),
+        save_interval=int(os.environ.get(f"{env_prefix}KV_SAVE_INTERVAL", "0")),
         restore_tokens=int(os.environ.get(f"{env_prefix}KV_RESTORE_TOKENS", "0")),
     )
     proxy = LlamaCacheProxy(

@@ -8,9 +8,9 @@ forked at upstream `v0.2.0` (commit `2ffb14c`).
 
 Newest first.
 
-### Per-request cache controls (`kv-save`, `kv-restore`, `kv-save-growth`, `kv-restore-tokens`)
+### Per-request cache controls (`kv-save`, `kv-restore`, `kv-save-growth`, `kv-save-interval`, `kv-restore-tokens`)
 
-Four generic controls over snapshot reads and writes, each available as a
+Five generic controls over snapshot reads and writes, each available as a
 header (`X-KV-Save`), a body field (`kv_save`), an inline message tag
 (`[[x-kv-save: false]]`) and an environment default (`KV_SAVE`); precedence
 header > body > tag > env. See "Per-request cache controls" in the README.
@@ -28,6 +28,11 @@ header > body > tag > env. See "Per-request cache controls" in the README.
   shutdown and `before_eviction` flushes still persist the unsaved tokens.
   (The branch's other fix, pruning orphaned `.tmp` snapshots, is already in
   upstream main.)
+- `kv-save-interval` (added 2026-10-22) skips rewriting the snapshot until
+  this many seconds have passed since the session's last persisted save. It
+  combines with `kv-save-growth`: a save happens only when every enabled gate
+  passes. Skipped saves mark the state dirty like a growth skip; a session
+  without a recorded save time (first save, proxy restart) saves.
 - `kv-restore-tokens` skips disk restores of snapshots smaller than this many
   tokens, where the token count is known (shared-prefix manifests, and session
   snapshots saved by the running process).
