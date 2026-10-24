@@ -8,6 +8,26 @@ forked at upstream `v0.2.0` (commit `2ffb14c`).
 
 Newest first.
 
+### Strata engine support (`PI_LLAMA_CACHE_ENGINE_HOLDS`, added 2026-10-25)
+
+Support for engines whose own conversation cache keeps the last N conversations
+in RAM and resumes them by prompt match — Strata — and whose slot metadata
+cannot prove which conversation a slot holds (they do not report per-slot token
+counts the llama.cpp way). `PI_LLAMA_CACHE_ENGINE_HOLDS=N` (default `0` = off,
+matching llama.cpp behavior) makes the proxy:
+
+- trust that the engine still holds the last N conversations it served since
+  the proxy started, sending such sessions straight through without a disk
+  restore or a `/slots` token-count check;
+- save the live conversation before a different session takes the engine, so a
+  deferred (`terminal`-policy) state survives the switch;
+- forget the live conversation when a disk restore replaces it, because the
+  restore overwrites the engine state without parking it.
+
+Sessions beyond the newest N are dropped from proxy memory (logged as
+`engine_hold_dropped`); their snapshots on disk remain and are restored when
+they return. See "Engines that hold conversations (Strata)" in the README.
+
 ### Per-request cache controls (`kv-save`, `kv-restore`, `kv-save-growth`, `kv-save-interval`, `kv-restore-tokens`)
 
 Five generic controls over snapshot reads and writes, each available as a

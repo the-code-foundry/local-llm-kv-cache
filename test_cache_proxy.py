@@ -2720,6 +2720,10 @@ class CacheProxyTests(unittest.TestCase):
     def test_direct_finish_still_enforces_cache_limit(self):
         old_snapshot = Path(self.tempdir.name, "local-llm-session-old-direct.bin")
         old_snapshot.write_bytes(b"old")
+        # Push the mtime into the past: written in the same timestamp granule
+        # as the new snapshot, the prune order would be the directory order.
+        past = old_snapshot.stat().st_mtime - 10
+        os.utime(old_snapshot, (past, past))
         new_snapshot = Path(self.tempdir.name, "local-llm-session-new-direct.bin")
         self.proxy.max_cache_bytes = len(b"new")
         self.proxy._save = Mock(
@@ -3203,6 +3207,111 @@ class KvControlsProxyTests(unittest.TestCase):
                 delattr(ProxyHandler, "proxy")
             else:
                 ProxyHandler.proxy = previous_proxy
+
+
+class EngineHoldsProxyTests(unittest.TestCase):
+    """PI_LLAMA_CACHE_ENGINE_HOLDS: engines (e.g. Strata) that keep the last N
+    conversations in RAM and resume them by prompt match, whose slot metadata
+    cannot prove which conversation a slot holds."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        FakeLlamaHandler.cache_dir = self.tempdir.name
+        FakeLlamaHandler.restored = []
+        FakeLlamaHandler.saved = []
+        FakeLlamaHandler.restore_failed = False
+        FakeLlamaHandler.restore_tokens = 10
+        FakeLlamaHandler.slot_tokens = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLlamaHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.body = {
+            "model": "qwen3.8:27b",
+            "messages": [
+                {"role": "system", "content": "project rules"},
+                {"role": "user", "content": "request"},
+            ],
+            "tools": [],
+        }
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def _proxy(self, holds=None, **kwargs):
+        proxy = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            max_cache_gib=1,
+            wait_seconds=1,
+            enable_prefix_seeding=False,
+            **kwargs,
+        )
+        if holds is not None:
+            proxy.engine_holds = holds
+        return proxy
+
+    def test_engine_holds_env_parsing(self):
+        with patch.dict(os.environ, {"PI_LLAMA_CACHE_ENGINE_HOLDS": "3"}):
+            self.assertEqual(self._proxy().engine_holds, 3)
+        with patch.dict(os.environ, {"PI_LLAMA_CACHE_ENGINE_HOLDS": ""}):
+            self.assertEqual(self._proxy().engine_holds, 0)
+        with patch.dict(os.environ, {"PI_LLAMA_CACHE_ENGINE_HOLDS": "-2"}):
+            self.assertEqual(self._proxy().engine_holds, 0)
+
+    def test_hot_state_trusted_without_slot_check(self):
+        proxy = self._proxy(holds=1)
+        _, plan = proxy.prepare(self.body, "session-a")
+        proxy.finish(plan, 200)
+        # On llama.cpp this token-count mismatch would invalidate the hot state.
+        FakeLlamaHandler.slot_tokens = 99
+
+        _, hot_plan = proxy.prepare(self.body, "session-a")
+
+        self.assertEqual(hot_plan.slot_id, 0)
+        self.assertEqual(FakeLlamaHandler.restored, [])
+
+    def test_switch_saves_dirty_live_session_first(self):
+        proxy = self._proxy(holds=2, save_policy="terminal")
+        _, plan_b = proxy.prepare(self.body, "session-b")
+        proxy.finish(plan_b, 200)
+        _, plan_a = proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 10
+        proxy.finish(plan_a, 200, finish_reason="tool_calls")
+        self.assertTrue(proxy.session_states["session-a"].dirty)
+        saved_before = len(FakeLlamaHandler.saved)
+
+        # session-b takes the engine; the live session-a must be saved first.
+        proxy.prepare(self.body, "session-b")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), saved_before + 1)
+        self.assertFalse(proxy.session_states["session-a"].dirty)
+
+    def test_hold_keeps_newest_n_sessions(self):
+        proxy = self._proxy(holds=1)
+        _, plan_a = proxy.prepare(self.body, "session-a")
+        proxy.finish(plan_a, 200)
+        _, plan_b = proxy.prepare(self.body, "session-b")
+        proxy.finish(plan_b, 200)
+
+        self.assertEqual(list(proxy.session_states), ["session-b"])
+        self.assertEqual(proxy.live_session, "session-b")
+
+    def test_restore_forgets_live_session_it_replaced(self):
+        proxy = self._proxy(holds=1)
+        _, plan_b = proxy.prepare(self.body, "session-b")
+        proxy.finish(plan_b, 200)
+        _, plan_a = proxy.prepare(self.body, "session-a")
+        proxy.finish(plan_a, 200)
+        # session-b was dropped from memory by the hold, its snapshot remains.
+        self.assertEqual(list(proxy.session_states), ["session-a"])
+
+        _, restored_plan = proxy.prepare(self.body, "session-b")
+
+        self.assertEqual(len(FakeLlamaHandler.restored), 1)
+        self.assertEqual(restored_plan.slot_id, 0)
+        # The restore replaced the live conversation without parking it.
+        self.assertNotIn("session-a", proxy.session_states)
 
 
 if __name__ == "__main__":

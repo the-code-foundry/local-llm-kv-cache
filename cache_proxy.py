@@ -466,6 +466,14 @@ class LlamaCacheProxy:
         self.minimum_shared_prefix_tokens = minimum_shared_prefix_tokens
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
+        # PI_LLAMA_CACHE_ENGINE_HOLDS=N (0 = off): the engine itself keeps the last N
+        # conversations it served in RAM and resumes them by prompt match (Strata's
+        # conversation cache), and its slot metadata cannot prove which one it holds.
+        # Then a session served since the proxy started is sent straight through, no
+        # disk restore; the live one is saved before another takes the engine; a disk
+        # restore (which replaces the live conversation unparked) forgets the live one.
+        self.engine_holds = max(0, int(os.environ.get("PI_LLAMA_CACHE_ENGINE_HOLDS", "0") or 0))
+        self.live_session: str | None = None
         self.active_slot_ids: set[int] = set()
         self.active_slot_snapshots: dict[int, Path] = {}
         self.seed_slot_ids: set[int] = set()
@@ -502,6 +510,8 @@ class LlamaCacheProxy:
             state = self.session_states.get(session_id)
             if state is not None and state.dirty:
                 self._flush_dirty_states("before_no_save_request")
+        if self.engine_holds and self.live_session not in (None, session_id):
+            self._flush_dirty_states("before_switch")
         hot_state = self._hot_state(self.session_states.get(session_id), prefix_key)
         restored_source = None
         candidate_slot_id = None
@@ -916,6 +926,8 @@ class LlamaCacheProxy:
             )
             did_save = True
         self.session_states[plan.session_id] = state
+        if self.engine_holds:
+            self._hold(plan.session_id)
         _log_event(
             "request_complete",
             session_ref=session_ref,
@@ -1023,6 +1035,8 @@ class LlamaCacheProxy:
     def _hot_state(self, state: SlotState | None, prefix_key: str) -> SlotState | None:
         if state is None or state.prefix_key != prefix_key:
             return None
+        if self.engine_holds:
+            return state
         for slot in self._slots():
             if int(slot.get("id", -1)) != state.slot_id:
                 continue
@@ -1034,6 +1048,8 @@ class LlamaCacheProxy:
         return None
 
     def _forget_slot(self, slot_id: int) -> None:
+        if self.engine_holds:
+            return  # one engine, many held conversations: see _restore and _hold
         self.session_states = {
             key: state for key, state in self.session_states.items() if state.slot_id != slot_id
         }
@@ -1593,7 +1609,21 @@ class LlamaCacheProxy:
         n_restored = int(result.get("n_restored") or 0)
         if n_restored <= 0:
             raise RuntimeError(f"llama restored no tokens from {filename.name}")
+        if self.engine_holds and self.live_session is not None:
+            # the restore replaced the live conversation without parking it
+            self.session_states.pop(self.live_session, None)
+            self.live_session = None
         return n_restored
+
+    def _hold(self, session_id: str) -> None:
+        """Engine-holds mode: session_id is the live conversation; keep the newest N."""
+        self.live_session = session_id
+        state = self.session_states.pop(session_id)
+        self.session_states[session_id] = state  # newest last
+        while len(self.session_states) > self.engine_holds:
+            oldest = next(iter(self.session_states))
+            dropped = self.session_states.pop(oldest)
+            _log_event("engine_hold_dropped", session_ref=_session_ref(oldest), dirty=dropped.dirty)
 
     def _save(
         self,

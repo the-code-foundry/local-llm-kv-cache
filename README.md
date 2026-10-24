@@ -9,6 +9,8 @@ This project adds a persistent KV cache to Hermes Agent and local OpenAI-compati
 
 With the provided systemd unit, the proxy listens on `127.0.0.1:18082` and forwards requests to llama.cpp on `127.0.0.1:8080`. llama.cpp performs the actual prompt caching and checkpoint restoration; the proxy never fabricates false-positive results.
 
+Other engines that implement the same slot save/restore API work behind the proxy as well, including support for Strata through `PI_LLAMA_CACHE_ENGINE_HOLDS` (see below).
+
 > [!IMPORTANT]
 > Hybrid or recurrent models such as Qwen3.8 require a llama.cpp version that correctly persists their checkpoints. The validated deployment uses the `local/kv-restore-checkpoints` branch, commit `862535a`. Without this fix, llama.cpp may report `n_restored > 0` while the following request remains at `cache_n=0`. See [llama.cpp PR #26004](https://github.com/ggml-org/llama.cpp/pull/26004).
 
@@ -45,8 +47,28 @@ If llama.cpp is not listening on `127.0.0.1:8080`, change `PI_LLAMA_UPSTREAM` in
 | `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | When `true`, rejects cache-managed text chat requests that provide no session identifier. Requests containing media remain accepted: they are serialized but unmanaged after any dirty state has been saved. |
 | `PI_LLAMA_CACHE_ANONYMOUS_AFFINITY` | `project` | Fallback key when no explicit session ID exists. `project` hashes only the stable system prefix; `conversation-start` also hashes the first non-system message so concurrent agent conversations do not share one snapshot. |
 | `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshots. A successful restore or hot reuse updates recency. |
+| `PI_LLAMA_CACHE_ENGINE_HOLDS` | `0` | For engines whose own conversation cache keeps the last N conversations in RAM and resumes them by prompt match, such as Strata, and whose slot metadata cannot prove which conversation a slot holds. `0` (the default) keeps the llama.cpp slot-verification behavior. |
 
 The `terminal` policy is intended for agents that chain many tool calls. Deferred state remains in the hot slot and is saved before a cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy takes the safe path and saves immediately.
+
+### Engines that hold conversations (Strata)
+
+Strata keeps the last N conversations it served in RAM and resumes them by prompt
+match, but it does not report per-slot token counts the llama.cpp way, so the
+proxy cannot verify a hot slot against `/slots` metadata. With
+`PI_LLAMA_CACHE_ENGINE_HOLDS=N` (matching the engine's own conversation-cache
+depth) the proxy instead:
+
+- trusts that the engine still holds the last N conversations it served since the
+  proxy started, and sends such a session straight through without a disk restore
+  or a slot token-count check;
+- saves the live conversation before a different session takes the engine, so a
+  deferred (`terminal`-policy) state is never lost to a switch;
+- forgets the live conversation when a disk restore replaces it, because the
+  restore overwrites the engine state without parking it.
+
+Sessions beyond the newest N are dropped from the proxy's memory (their snapshots
+on disk remain) and are restored from disk when they return.
 
 ### Per-request cache controls
 
@@ -535,7 +557,7 @@ Before a deployment:
 
 1. record the candidate commit/package and the currently active generation as the rollback target;
 2. inventory, without displaying them, the counts of prefix snapshots, manifests, and sessions, as well as free space;
-3. run Python compilation, all 123 tests, branch coverage, and `git diff --check`;
+3. run Python compilation, the full test suite, branch coverage, and `git diff --check`;
 4. build the package and declarative configuration without stopping the active service;
 5. perform a dry activation when the system manager supports it;
 6. activate exactly one proxy instance and one llama.cpp instance, then verify units, ports, and `/health`;
@@ -666,7 +688,7 @@ nix shell nixpkgs#python3Packages.coverage --command sh -c \
   'coverage run --branch --source=. -m unittest discover -s . -p "test_*.py" -v && coverage report --include="cache_core.py,cache_proxy.py" --fail-under=100'
 ```
 
-At present, the suite contains 123 tests. It reaches 100% line and branch coverage on the modified `cache_core.py` and `cache_proxy.py` modules.
+At present, the suite contains 157 tests. It reaches 100% line and branch coverage on `cache_core.py` and 96% on `cache_proxy.py`; the fork's additions are fully covered.
 
 ## Files and configuration points
 
