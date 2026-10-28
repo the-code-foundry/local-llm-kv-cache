@@ -17,14 +17,15 @@ import math
 import os
 import re
 import signal
+import socket
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from cache_core import (
@@ -391,6 +392,33 @@ class PendingPrefixSeed:
 
 class _NoIdleSlot(RuntimeError):
     """Signal that all llama slots are reserved by foreground requests."""
+
+
+class ClientDisconnected(OSError):
+    """The downstream client went away; the request was cancelled."""
+
+
+# How often a forwarding thread checks whether its client is still connected.
+CLIENT_WATCH_INTERVAL = 0.25
+
+
+def _client_disconnected(handler: BaseHTTPRequestHandler) -> bool:
+    """True only when the client socket has reached EOF.
+
+    The request body has already been read in full, so bytes arriving on the
+    socket (a pipelined follow-up request) mean the client is still there;
+    only ``recv`` returning ``b""`` proves it hung up. A socket error also
+    counts as gone."""
+    connection = getattr(handler, "connection", None)
+    if connection is None:
+        return False
+    try:
+        data = connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+    return data == b""
 
 
 class LlamaCacheProxy:
@@ -1305,10 +1333,15 @@ class LlamaCacheProxy:
         body: dict[str, Any],
         session_id: str,
         controls: KvControls | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, Any], SnapshotPlan]:
         """Atomically prepare and reserve one slot for a managed request."""
         deadline = time.monotonic() + self.wait_seconds
         while True:
+            # A cancelled client must not trigger a restore, take a slot, or
+            # keep other requests waiting behind this one.
+            if is_cancelled is not None and is_cancelled():
+                raise ClientDisconnected("client disconnected before the request took a slot")
             with self.operation_lock:
                 try:
                     request, plan = self.prepare(
@@ -1479,46 +1512,83 @@ class LlamaCacheProxy:
         upstream = HTTPConnection(self.upstream_host, self.upstream_port, timeout=1200)
         headers = self._forward_headers(handler)
         is_head = method == "HEAD"
-        upstream.request(method, f"{self.upstream_prefix}{path}", body=body, headers=headers)
-        response = upstream.getresponse()
-        setattr(handler, "_proxy_response_started", True)
-        handler.send_response(response.status, response.reason)
-        for key, value in response.getheaders():
-            normalized_key = key.lower()
-            if normalized_key in HOP_BY_HOP_HEADERS and not (
-                is_head and normalized_key == "content-length"
-            ):
-                continue
-            handler.send_header(key, value)
-        if not is_head:
-            handler.send_header("Transfer-Encoding", "chunked")
-        handler.end_headers()
-        metadata_buffer = bytearray()
+        cancelled = threading.Event()
+        finished = threading.Event()
+
+        def _watch_client() -> None:
+            # A non-streaming request writes nothing to the client until the
+            # whole answer is ready, so a hung-up client would otherwise only
+            # be noticed when the upstream finishes or times out. Shut the
+            # upstream socket down as soon as the client goes: the blocked
+            # getresponse()/read1() wakes immediately, and llama-server sees
+            # its own client disconnect and stops generating.
+            while not finished.wait(CLIENT_WATCH_INTERVAL):
+                if _client_disconnected(handler):
+                    cancelled.set()
+                    sock = upstream.sock
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    return
+
+        watcher = threading.Thread(target=_watch_client, daemon=True)
+        watcher.start()
         try:
-            while True:
-                # ``HTTPResponse.read(size)`` waits for ``size`` bytes or EOF and
-                # therefore buffers small SSE events until generation completes.
-                # ``read1`` returns data from a single underlying socket read, so
-                # each available upstream fragment can be flushed immediately.
-                chunk = response.read1(64 * 1024)
-                if not chunk:
-                    break
-                metadata_buffer.extend(chunk)
-                if len(metadata_buffer) > MAX_METADATA_BYTES:
-                    del metadata_buffer[:-MAX_METADATA_BYTES]
-                if not is_head:
-                    handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
-                    handler.wfile.write(chunk)
-                    handler.wfile.write(b"\r\n")
-                    handler.wfile.flush()
+            upstream.request(method, f"{self.upstream_prefix}{path}", body=body, headers=headers)
+            response = upstream.getresponse()
+            setattr(handler, "_proxy_response_started", True)
+            handler.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                normalized_key = key.lower()
+                if normalized_key in HOP_BY_HOP_HEADERS and not (
+                    is_head and normalized_key == "content-length"
+                ):
+                    continue
+                handler.send_header(key, value)
             if not is_head:
-                handler.wfile.write(b"0\r\n\r\n")
-                handler.wfile.flush()
-            return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
-        except (BrokenPipeError, ConnectionResetError):
-            LOGGER.debug("client disconnected while proxying %s %s", method, path)
-            return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
+                handler.send_header("Transfer-Encoding", "chunked")
+            handler.end_headers()
+            metadata_buffer = bytearray()
+            try:
+                while True:
+                    # ``HTTPResponse.read(size)`` waits for ``size`` bytes or EOF and
+                    # therefore buffers small SSE events until generation completes.
+                    # ``read1`` returns data from a single underlying socket read, so
+                    # each available upstream fragment can be flushed immediately.
+                    chunk = response.read1(64 * 1024)
+                    if not chunk:
+                        break
+                    metadata_buffer.extend(chunk)
+                    if len(metadata_buffer) > MAX_METADATA_BYTES:
+                        del metadata_buffer[:-MAX_METADATA_BYTES]
+                    if not is_head:
+                        handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                        handler.wfile.write(chunk)
+                        handler.wfile.write(b"\r\n")
+                        handler.wfile.flush()
+                if cancelled.is_set():
+                    raise ClientDisconnected("client disconnected while proxying request")
+                if not is_head:
+                    handler.wfile.write(b"0\r\n\r\n")
+                    handler.wfile.flush()
+                return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
+            except (BrokenPipeError, ConnectionResetError) as error:
+                if cancelled.is_set():
+                    raise ClientDisconnected("client disconnected while proxying request") from error
+                LOGGER.debug("client disconnected while proxying %s %s", method, path)
+                return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
+        except ClientDisconnected:
+            raise
+        except (OSError, HTTPException) as error:
+            # The watcher shutting the upstream socket down surfaces here as a
+            # connection error from getresponse()/read1().
+            if cancelled.is_set():
+                raise ClientDisconnected("client disconnected while proxying request") from error
+            raise
         finally:
+            finished.set()
             upstream.close()
 
     def _forward_headers(self, handler: BaseHTTPRequestHandler) -> dict[str, str]:
@@ -1812,6 +1882,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_upstream_error(error)
 
     def _send_upstream_error(self, error: Exception) -> None:
+        if isinstance(error, ClientDisconnected):
+            # Nobody is left to answer; writing an error would hit the dead
+            # socket. The reserved slot was already released by the caller.
+            _log_event("client_disconnected", path=self.path)
+            self.close_connection = True
+            return
         LOGGER.exception("upstream request failed")
         if not getattr(self, "_proxy_response_started", False) and not self.wfile.closed:
             self.send_error(503, f"upstream unavailable: {error}")
@@ -1895,7 +1971,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         reservation_released = False
         try:
             with self.proxy.session_operation(session_id):
-                request, plan = self.proxy.begin_request(body, session_id, kv_controls)
+                request, plan = self.proxy.begin_request(
+                    body,
+                    session_id,
+                    kv_controls,
+                    is_cancelled=lambda: _client_disconnected(self),
+                )
                 try:
                     result = self.proxy.forward(
                         self,

@@ -1,9 +1,11 @@
 import json
 import os
 import runpy
+import socket
 import signal
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -91,7 +93,7 @@ class UnavailableProxy:
     def session_operation(self, _session_id):
         yield
 
-    def begin_request(self, body, session_id, controls=None):
+    def begin_request(self, body, session_id, controls=None, is_cancelled=None):
         return self.prepare(body, session_id)
 
     def prepare(self, *_args):
@@ -118,7 +120,7 @@ class CapturingProxy:
         self.session_ids.append(session_id)
         return body, None
 
-    def begin_request(self, body, session_id, controls=None):
+    def begin_request(self, body, session_id, controls=None, is_cancelled=None):
         return self.prepare(body, session_id)
 
     def prepare_uncached(self, reason):
@@ -3312,6 +3314,146 @@ class EngineHoldsProxyTests(unittest.TestCase):
         self.assertEqual(restored_plan.slot_id, 0)
         # The restore replaced the live conversation without parking it.
         self.assertNotIn("session-a", proxy.session_states)
+
+
+class SlowLlamaHandler(FakeLlamaHandler):
+    """Stalls chat completions like a long generation; management calls stay fast."""
+
+    stall = threading.Event()
+
+    def do_POST(self):
+        if self.path.endswith("/chat/completions"):
+            type(self).stall.wait(10)
+            try:
+                self._json({"status": "ok"})
+            except OSError:
+                pass  # the proxy shut this connection down mid-stall
+            return
+        super().do_POST()
+
+
+class ClientDisconnectTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        SlowLlamaHandler.cache_dir = self.tempdir.name
+        SlowLlamaHandler.restored = []
+        SlowLlamaHandler.saved = []
+        SlowLlamaHandler.restore_failed = False
+        SlowLlamaHandler.restore_tokens = 10
+        SlowLlamaHandler.slot_tokens = 0
+        SlowLlamaHandler.stall = threading.Event()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), SlowLlamaHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.proxy = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            max_cache_gib=1,
+            wait_seconds=1,
+            enable_prefix_seeding=False,
+        )
+        self.body = {
+            "model": "qwen3.8:27b",
+            "messages": [
+                {"role": "system", "content": "project rules"},
+                {"role": "user", "content": "request"},
+            ],
+            "tools": [],
+        }
+
+    def tearDown(self):
+        SlowLlamaHandler.stall.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def test_client_disconnected_reads_socket_eof_only(self):
+        class _Carrier:
+            pass
+
+        no_connection = _Carrier()
+        self.assertFalse(cache_proxy._client_disconnected(no_connection))
+
+        open_pair = socket.socketpair()
+        pipelined_pair = socket.socketpair()
+        closed_pair = socket.socketpair()
+        try:
+            handler = _Carrier()
+            handler.connection = open_pair[0]
+            self.assertFalse(cache_proxy._client_disconnected(handler))
+
+            # Bytes on the socket are a pipelined follow-up, not a hang-up.
+            pipelined_pair[1].sendall(b"x")
+            handler.connection = pipelined_pair[0]
+            self.assertFalse(cache_proxy._client_disconnected(handler))
+
+            closed_pair[1].close()
+            handler.connection = closed_pair[0]
+            self.assertTrue(cache_proxy._client_disconnected(handler))
+        finally:
+            for pair in (open_pair, pipelined_pair, closed_pair):
+                for end in pair:
+                    end.close()
+
+    def test_begin_request_aborts_before_taking_a_slot_when_cancelled(self):
+        with self.assertRaises(cache_proxy.ClientDisconnected):
+            self.proxy.begin_request(self.body, "session-a", is_cancelled=lambda: True)
+
+        self.assertEqual(self.proxy.active_slot_ids, set())
+        self.assertEqual(SlowLlamaHandler.restored, [])
+
+    def test_forward_aborts_blocked_upstream_wait_when_client_goes(self):
+        handler = RecordingHandler()
+        client_end, peer_end = socket.socketpair()
+        handler.connection = client_end
+        peer_end.close()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(cache_proxy.ClientDisconnected):
+                # The upstream stalls for 10 s; the watcher must abort the
+                # blocked getresponse() long before that.
+                self.proxy.forward(handler, "POST", "/v1/chat/completions", b"{}")
+        finally:
+            client_end.close()
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_handler_cancels_managed_request_when_client_disconnects(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        ProxyHandler.proxy = self.proxy
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            payload = json.dumps(self.body).encode("utf-8")
+            request = (
+                "POST /v1/chat/completions HTTP/1.1\r\n"
+                "Host: proxy\r\n"
+                "Content-Type: application/json\r\n"
+                "X-Session-Id: cancel-e2e\r\n"
+                f"Content-Length: {len(payload)}\r\n\r\n"
+            ).encode("ascii") + payload
+            client = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            try:
+                client.sendall(request)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not self.proxy.active_slot_ids:
+                    time.sleep(0.02)
+                self.assertEqual(self.proxy.active_slot_ids, {0})
+            finally:
+                client.close()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.proxy.active_slot_ids:
+                time.sleep(0.05)
+            self.assertEqual(self.proxy.active_slot_ids, set())
+            self.assertEqual(SlowLlamaHandler.saved, [])
+            self.assertNotIn("cancel-e2e", self.proxy.session_states)
+        finally:
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
 
 
 if __name__ == "__main__":

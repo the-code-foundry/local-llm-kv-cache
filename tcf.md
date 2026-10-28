@@ -8,6 +8,27 @@ forked at upstream `v0.2.0` (commit `2ffb14c`).
 
 Newest first.
 
+### Request cancellation on client disconnect (added 2026-10-29)
+
+The proxy previously noticed a client hang-up only when a write to the client
+failed. A non-streaming request writes nothing until the whole answer is ready,
+so a client timing out (e.g. behind llama-swap) left llama-server generating
+until completion or the proxy's 1200 s upstream timeout, holding the slot and
+the session lock the whole time. Now:
+
+- every forwarded request runs a watcher that polls the client socket every
+  250 ms; on end-of-file it shuts down the upstream connection, which wakes the
+  blocked response wait immediately and makes llama-server stop generating
+  (its own client — the proxy — disconnected);
+- a cancelled request is abandoned, not completed: the reserved slot is
+  released, no snapshot is written, and a `client_disconnected` event is
+  logged;
+- a request whose client is already gone is also abandoned at the
+  reserve-a-slot loop, before it triggers a restore or waits up to
+  `wait_seconds` for a slot;
+- bytes arriving on the client socket (a pipelined follow-up request) count as
+  alive; only EOF counts as a hang-up.
+
 ### Strata engine support (`PI_LLAMA_CACHE_ENGINE_HOLDS`, added 2026-10-25)
 
 Support for engines whose own conversation cache keeps the last N conversations

@@ -211,6 +211,10 @@ The proxy filters headers named in its static `HOP_BY_HOP_HEADERS` set (`Connect
 
 The `test_forward_streams_body_and_filters_hop_by_hop_headers` regression test verifies that multiple upstream fragments remain multiple downstream chunks and that the forwarding path calls `read1`, not `read`. In production, a timing probe must observe the first `data:` event before the last, with a non-zero time gap during a multi-token generation.
 
+### Client disconnects and cancellation
+
+Each forwarded request runs a watcher that checks the client connection every 250 ms. When the client hangs up — for example a caller timing out behind llama-swap — the proxy shuts down its connection to the upstream at once, so the blocked wait for the response wakes immediately and llama-server, seeing its own client disconnect, stops generating. Without this, a non-streaming request writes nothing to the client until the whole answer is ready and would otherwise run to completion or to the upstream timeout. The request is then cancelled, not completed: the reserved slot is released and no snapshot is written. A request whose client has already gone is also abandoned before it restores a snapshot or takes a slot. Bytes arriving on the client socket count as a pipelined follow-up, not a hang-up; only end-of-file does. A disconnect appears in the logs as a `client_disconnected` event. Setting an output cap on the server (`LLAMA_ARG_N_PREDICT`) remains a sensible backstop.
+
 ## Problem addressed
 
 The first message from a coding agent often contains:
@@ -688,7 +692,7 @@ nix shell nixpkgs#python3Packages.coverage --command sh -c \
   'coverage run --branch --source=. -m unittest discover -s . -p "test_*.py" -v && coverage report --include="cache_core.py,cache_proxy.py" --fail-under=100'
 ```
 
-At present, the suite contains 157 tests. It reaches 100% line and branch coverage on `cache_core.py` and 96% on `cache_proxy.py`; the fork's additions are fully covered.
+At present, the suite contains 161 tests. It reaches 100% line and branch coverage on `cache_core.py` and 96% on `cache_proxy.py`; the fork's additions are fully covered.
 
 ## Files and configuration points
 
